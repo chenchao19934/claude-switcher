@@ -172,6 +172,8 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 开发者可在 macOS 上运行 `python3 -m unittest discover -s tests -v`，其中菜单栏模型测试使用假核心脚本，不访问真实账号或网络。隔离 UI 验证方法见 [tests/MENU-BAR-TESTING.md](tests/MENU-BAR-TESTING.md)。
 
+Mac 开发环境、隔离界面启动与应用打包见 [macOS 开发指南](docs/MACOS-DEVELOPMENT.md)。快速开始：`bash scripts/dev-macos.sh doctor`，然后 `bash scripts/dev-macos.sh run`。
+
 ## 多账号（A–D）
 
 除 A/B 外，还支持 C、D 两个账号槽位，最多同时保留四份互不干扰的登录态。
