@@ -261,17 +261,14 @@ class DesktopUpdateTests(unittest.TestCase):
         self.assertEqual(self.worker(token)['state'], 'error')
         self.assertEqual(self.installed(), before)
 
-    def test_prepare_build_or_audit_failure_never_replaces(self):
+    def test_prepare_bundle_failure_never_replaces(self):
         before = self.installed()
-        for kind in ('build', 'audit'):
-            with self.subTest(kind=kind):
-                self.backend.build_fails = kind == 'build'
-                self.backend.audit_rc = 7 if kind == 'audit' else 0
-                with self.assertRaises(UPDATE.UpdateError):
-                    self.updater.prepare()
-                self.assertEqual(self.installed(), before)
-                self.assertFalse(list(self.app.parent.glob('.claude-switcher-update-*')))
-                self.assertFalse((self.stun.parent / '.update.lock').exists())
+        self.backend.build_fails = True
+        with self.assertRaises(UPDATE.UpdateError):
+            self.updater.prepare()
+        self.assertEqual(self.installed(), before)
+        self.assertFalse(list(self.app.parent.glob('.claude-switcher-update-*')))
+        self.assertFalse((self.stun.parent / '.update.lock').exists())
 
     def test_manifest_missing_required_or_modified_file_is_rejected(self):
         for relative in UPDATE.REQUIRED:
@@ -471,17 +468,27 @@ class DesktopUpdateTests(unittest.TestCase):
         self.assertEqual(self.worker(token)['state'], 'error')
         self.assertFalse(self.stun.exists())
 
-    def test_worker_checks_new_probe_before_launch_and_rolls_back(self):
+    def test_environment_failure_does_not_block_preparing_or_installing_software(self):
         before = self.installed()
-        token = self.prepare()
-        self.backend.fail_installed_audit = True
-        self.assertEqual(self.worker(token)['state'], 'error')
+        self.backend.audit_output = AUDIT.replace('TUN网卡=ok', 'TUN网卡=fail').replace('时区=ok', '时区=fail')
+        self.backend.audit_rc = 1
+        self.backend.audit = mock.Mock(side_effect=UPDATE.UpdateError('模拟环境检查失败'))
+        prepared = self.updater.prepare()
+        self.assertEqual(prepared['state'], 'prepared')
+        self.assertNotIn('完整检查已通过', prepared['message'])
         self.assertEqual(self.installed(), before)
+        token = prepared['token']
+        self.assertEqual(self.worker(token)['state'], 'updated')
+        self.assertNotEqual(self.installed(), before)
         self.assertEqual(self.backend.launches, [token])
-        self.assertEqual(self.backend.audit_calls, 2)
-        self.assertEqual(self.backend.audit_records[0][0], self.updater.stage_path(token) / 'new-core.sh')
-        self.assertEqual(self.backend.audit_records[0][1], 'old stun')
-        self.assertEqual(self.backend.audit_records[1], (self.core, 'new core/stun-probe.py'))
+        self.backend.audit.assert_not_called()
+
+    def test_environment_timeout_does_not_block_software_update(self):
+        self.backend.audit = mock.Mock(side_effect=UPDATE.subprocess.TimeoutExpired('checkdetail', 120))
+        token = self.prepare()
+        self.assertEqual(self.worker(token)['state'], 'updated')
+        self.backend.audit.assert_not_called()
+        self.assertEqual(UPDATE.read_json(self.updater.stage_path(token) / 'receipt.json')['phase'], 'updated')
 
     def test_apply_waits_for_real_worker_ready_before_returning(self):
         token = self.prepare()

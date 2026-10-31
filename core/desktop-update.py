@@ -542,6 +542,7 @@ class Backend:
         self.verify_bundle(output, version, entries)
 
     def audit(self, core):
+        # Explicit diagnostics only; environment health is never software update admission.
         # The caller's installed settings/defaults must be used; no Claude launch occurs.
         try:
             result = subprocess.run(["/bin/bash", str(core), "checkdetail"], capture_output=True,
@@ -748,7 +749,6 @@ class Updater:
                 shutil.copyfile(source / "core/stun-probe.py", stage / "new-stun.py")
                 (stage / "new-stun.py").chmod(0o600)
                 self.backend.build(source, stage / "new-app.app", self.app, revision, entries)
-                self.backend.audit(new_core)
                 record = {"schema": 1, "token": token, "created": time.time(), "phase": "prepared",
                           "version": revision, "notice": notice, "app": str(self.app), "core": str(self.core), "stun": str(self.stun),
                           "original": original, "new": {"app": tree_digest(stage / "new-app.app"),
@@ -759,7 +759,7 @@ class Updater:
                 record["worker"] = digest(stage / "worker.py")
                 write_json(stage / "receipt.json", record)
                 return {"state": "prepared", "version": revision, "token": token,
-                        "message": self.message_with_notice("正式安装包下载、校验和完整检查已通过，可以重启完成更新", notice)}
+                        "message": self.message_with_notice("正式安装包下载和完整性校验已通过，可以重启完成更新", notice)}
             except BaseException:
                 shutil.rmtree(stage)
                 raise
@@ -879,8 +879,6 @@ class Updater:
                 os.replace(fresh, target)
             if self.originals() != record["new"]:
                 raise UpdateError("替换后工件校验失败")
-            # Validate the installed new probe together with the new core before launching the GUI.
-            self.backend.audit(self.core)
             record["phase"] = "awaiting_ack"
             record["ackDeadline"] = time.time() + ack_timeout
             write_json(stage / "receipt.json", record)

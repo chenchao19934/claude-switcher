@@ -1789,7 +1789,6 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
-import pwd
 import re
 import shlex
 import signal
@@ -1802,9 +1801,6 @@ import zipfile
 
 REPOSITORY = "chenchao19934/claude-switcher"
 CONFIG = ("PROXY_MODE", "PROXY_GROUP", "COUNTRY_TARGET", "TZ_TARGET", "LOCALE_TARGET")
-KEYS = {"代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
-        "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性"}
-OPTIONAL = {"IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性"}
 ARTIFACTS = ("core/claude-switch.sh", "core/stun-probe.py", "core/desktop-update.py")
 DAEMONS = ("daemons/claude-bodyguard.sh", "daemons/tz-watchdog.sh", "daemons/bodyguard-settings.py")
 
@@ -2021,25 +2017,13 @@ def atomic_write(path, data, mode=0o755):
         if os.path.exists(temporary):
             os.unlink(temporary)
 
-def audited(core, home):
-    command = ["/bin/bash", str(core), "checkdetail"]
-    if os.geteuid() == 0 and home.stat().st_uid != 0:
-        command = ["sudo", "-H", "-u", pwd.getpwuid(home.stat().st_uid).pw_name] + command
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=90)
-    except (OSError, UnicodeError, subprocess.TimeoutExpired):
-        return False
-    states = {}
-    for line in result.stdout.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        key, separator, value = line.partition("=")
-        state = value.split(":", 1)[0]
-        if (not separator or key not in KEYS or key in states or state not in ("ok", "warn", "skip")
-                or (state != "ok" and key not in OPTIONAL)):
-            return False
-        states[key] = state
-    return result.returncode == 0 and set(states) == KEYS
+def verify_installed(destinations, content):
+    # 软件更新只验证落盘工件，不执行环境安检或启动 Claude。
+    for path, expected in zip(destinations, content):
+        metadata = path.lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o755 or path.read_bytes() != expected):
+            fail("新版工件文件验证失败")
 
 def daemon_notice(source, home, values):
     managed = Path("/Library/Application Support/claude-switcher")
@@ -2082,8 +2066,7 @@ def update(source, core, base, home):
         for path, data in zip(destinations, content):
             touched.append(path)
             atomic_write(path, data)
-        if not audited(core, home):
-            fail("新版自检未通过")
+        verify_installed(destinations, content)
     except (OSError, UpdateError):
         recovered = True
         for path in reversed(touched):
@@ -2095,7 +2078,7 @@ def update(source, core, base, home):
                     atomic_write(path, original[0], original[1])
             except OSError:
                 recovered = False
-        fail("新版写入或自检失败，已自动回滚全部工件" if recovered else "更新失败且回滚未完整完成，请使用 .bak 备份恢复")
+        fail("新版写入或文件验证失败，已自动回滚全部工件" if recovered else "更新失败且回滚未完整完成，请使用 .bak 备份恢复")
     daemon_notice(source, home, values)
 
 def require_plain(path, directory=False):

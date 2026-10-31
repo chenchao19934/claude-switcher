@@ -640,8 +640,8 @@ final class VM: ObservableObject {
         let alert = NSAlert()
         alert.messageText = updateAvailable ? "更新 Claude 切换器并重启？" : "校验并修复当前版本组件？"
         alert.informativeText = updateAvailable
-            ? "将下载、校验并更新 App、核心脚本和检测探针，保留账号、检查设置及地区配置。准备完成后切换器会退出并重启；校验或安全检查失败会中止，替换或启动失败会自动回滚。系统守护组件不会被替换。"
-            : "会下载同一正式版并校验 App、核心脚本和检测探针，只在组件不一致时替换。保留账号、检查设置及地区配置；校验或安全检查失败会中止，替换或启动失败会自动回滚。系统守护组件不会被替换。"
+            ? "将更新切换器并自动重启，保留账号和设置。安装失败时自动回滚；Claude 启动前仍需通过安全检查。"
+            : "会下载当前正式版本，按需修复组件并保留账号和设置。安装失败时自动回滚；Claude 启动前仍需通过安全检查。"
         alert.addButton(withTitle: updateAvailable ? "更新并重启" : "校验并修复")
         alert.addButton(withTitle: "取消")
         installUpdate(confirmed: alert.runModal() == .alertFirstButtonReturn)
@@ -653,7 +653,7 @@ final class VM: ObservableObject {
         installingUpdate = true
         isBusy = true
         updateRestartRequested = false
-        updateText = "正在下载并校验正式版本…\n完整安全检查可能需要几分钟，请保持切换器运行。"
+        updateText = "正在下载并校验正式版本…\n完成后将自动重启切换器，请稍候。"
         runUpdate(["prepare"], timeout: 600) { result in
             guard let reply = self.updateReply(result, allowed: ["prepared", "current"]) else {
                 self.finishUpdateFailure(); return
@@ -1436,9 +1436,9 @@ struct UpdateControls: View {
                     .disabled(!vm.canInstallUpdate)
                 if vm.checkingUpdate || vm.installingUpdate { ProgressView().controlSize(.small) }
             }
-            Text("更新 App、核心脚本与检测探针；保留账号和配置。下载会使用系统代理，校验或安全检查失败会中止，替换或启动失败自动回滚。")
+            Text("更新会保留账号和设置，安装失败时自动回滚。环境检查不影响软件更新，Claude 启动前仍需通过安全检查。")
                 .font(.caption).foregroundColor(ClaudeTheme.muted)
-            Text("从正式发布版本下载更新，无需本机编译；系统守护组件的升级会另行提示。")
+            Text("系统守护组件如需升级，会另行提示。")
                 .font(.caption2).foregroundColor(ClaudeTheme.muted)
         }
     }

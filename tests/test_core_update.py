@@ -67,6 +67,7 @@ root = Path(os.environ["UPDATE_FIXTURE"])
 print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort : 19191\\n}")
 ''')
         self.stub("uname", 'import os\nprint(os.environ.get("UPDATE_ARCH", "' + os.uname().machine + '"))\n')
+        self.stub("open", 'import os\nfrom pathlib import Path\n(Path(os.environ["UPDATE_FIXTURE"]) / "claude-opened").touch()\n')
         self.package()
 
     def stub(self, name, script):
@@ -78,6 +79,7 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
         if audit is None:
             audit = "\n".join(key + "=ok" for key in KEYS)
         remote_core = ("#!/bin/bash\n" + CONFIG + "if [ \"${1:-}\" = checkdetail ]; then\n"
+                       + 'printf "%s\\n" checkdetail >> "$UPDATE_FIXTURE/environment-called"\n'
                        + "cat <<'AUDIT'\n" + audit + "\nAUDIT\nexit " + str(exit_code)
                        + "\nfi\nexit 2\n").encode()
         self.artifacts = {"core/claude-switch.sh": core if core is not None else remote_core,
@@ -262,22 +264,23 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
         self.assertIn(special + "\n", self.core.read_text())
         self.assertFalse((self.home / "ignored").exists())
 
-    def test_failed_incomplete_duplicate_nonzero_audits_roll_back_every_artifact(self):
+    def test_environment_results_do_not_gate_core_updates_or_launch_claude(self):
         cases = (("\n".join(key + "=ok" for key in KEYS[:-1]), 0),
                  ("\n".join(key + "=ok" for key in KEYS) + "\nTUN网卡=ok", 0),
-                 ("\n".join(key + "=ok" for key in KEYS).replace("TUN网卡=ok", "TUN网卡=fail"), 0),
-                 ("\n".join(key + "=ok" for key in KEYS), 7))
+                 ("\n".join(key + "=fail" for key in KEYS), 0),
+                 ("\n".join(key + "=ok" for key in KEYS), 7),
+                 ("", 2))
         for audit, code in cases:
             with self.subTest(code=code, audit=audit[-30:]):
                 self.core.write_bytes(self.original)
                 self.old_helpers()
-                previous = {path: path.read_bytes() for path in (self.core, self.base / "stun-probe.py", self.base / "desktop-update.py")}
                 self.package(audit=audit, exit_code=code)
                 result = self.run_update("update")
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("回滚全部工件", result.stdout)
-                for path, before in previous.items():
-                    self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((self.base / "stun-probe.py").read_bytes(), self.artifacts["core/stun-probe.py"])
+                self.assertEqual((self.base / "desktop-update.py").read_bytes(), self.artifacts["core/desktop-update.py"])
+                self.assertFalse((self.root / "environment-called").exists(), "升级不得执行环境checkdetail")
+                self.assertFalse((self.root / "claude-opened").exists(), "升级不得启动Claude")
                 self.assertFalse((self.base / ".update.lock").exists())
 
     def test_existing_lock_is_not_removed_and_parallel_updates_are_refused(self):
@@ -346,18 +349,61 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
         self.assertFalse(lock.exists())
         self.assertEqual(self.core.read_bytes(), self.original)
 
-    def test_hard_check_warnings_and_skips_cannot_pass_update_audit(self):
-        for status in ("skip", "warn"):
-            self.core.write_bytes(self.original)
-            audit = "\n".join(key + "=" + (status if key == "TUN网卡" else "ok") for key in KEYS)
-            self.package(audit=audit)
-            result = self.run_update("update")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("回滚全部工件", result.stdout)
-            self.assertEqual(self.core.read_bytes(), self.original)
-        self.package(audit="\n".join(key + "=" + ("skip" if key == "DNS" else "ok") for key in KEYS))
+    def updater_wrapper(self, body):
+        launcher = self.root / "wrapped-updater"
+        launcher.write_text("#!" + sys.executable + " -B\nimport os, sys\nfrom pathlib import Path\n"
+                            + body + "\nsource = sys.stdin.read()\nsys.argv = ['-'] + sys.argv[4:]\n"
+                            + "exec(compile(source, '<isolated updater>', 'exec'))\n")
+        launcher.chmod(0o755)
+        self.env["CLAUDE_SWITCHER_PYTHON"] = str(launcher)
+
+    def test_write_failure_restores_all_existing_artifacts(self):
+        self.old_helpers()
+        previous = {path: path.read_bytes() for path in (self.core, self.base / "stun-probe.py", self.base / "desktop-update.py")}
+        self.updater_wrapper("""original_replace = os.replace
+failed = False
+def failing_replace(source, destination):
+    global failed
+    if Path(destination).name == 'desktop-update.py' and not failed:
+        failed = True
+        raise OSError('synthetic replacement failure')
+    return original_replace(source, destination)
+os.replace = failing_replace""")
         result = self.run_update("update")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("回滚全部工件", result.stdout)
+        for path, original in previous.items():
+            self.assertEqual(path.read_bytes(), original)
+        self.assertFalse((self.base / ".update.lock").exists())
+        self.assertFalse((self.root / "environment-called").exists())
+
+    def test_installed_byte_or_permission_corruption_rolls_back_all_artifacts(self):
+        for mutation in ("bytes", "permissions"):
+            with self.subTest(mutation=mutation):
+                self.core.write_bytes(self.original)
+                self.old_helpers()
+                previous = {path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                            for path in (self.core, self.base / "stun-probe.py", self.base / "desktop-update.py")}
+                operation = ("core.write_bytes(core.read_bytes() + b'# synthetic corruption\\n')" if mutation == "bytes"
+                             else "core.chmod(0o644)")
+                self.updater_wrapper("""original_replace = os.replace
+changed = False
+def corrupting_replace(source, destination):
+    global changed
+    result = original_replace(source, destination)
+    if Path(destination).name == 'desktop-update.py' and not changed:
+        changed = True
+        core = Path(os.environ['HOME']) / '.local/bin/claude-switch.sh'
+        """ + operation + """
+    return result
+os.replace = corrupting_replace""")
+                result = self.run_update("update")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("回滚全部工件", result.stdout)
+                for path, (original, mode) in previous.items():
+                    self.assertEqual(path.read_bytes(), original)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+                self.assertFalse((self.root / "environment-called").exists())
 
     def test_syntax_invalid_candidate_is_rejected_before_backups(self):
         self.package(core=("#!/bin/bash\n" + CONFIG + "if [; then\n").encode())
@@ -467,7 +513,15 @@ exec(compile(source, '<isolated updater>', 'exec'))
         self.assertIn("非预期项", result.stdout)
 
     def test_missing_helpers_roll_back_to_absence(self):
-        self.package(audit="")
+        self.updater_wrapper("""original_replace = os.replace
+failed = False
+def failing_replace(source, destination):
+    global failed
+    if Path(destination).name == 'desktop-update.py' and not failed:
+        failed = True
+        raise OSError('synthetic replacement failure')
+    return original_replace(source, destination)
+os.replace = failing_replace""")
         result = self.run_update("update")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.core.read_bytes(), self.original)
