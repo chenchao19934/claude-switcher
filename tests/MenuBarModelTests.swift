@@ -677,9 +677,22 @@ struct MenuBarModelTests {
                 try f.updateResponse("check", state: "current", message: "已经是最新版本")
                 let vm = f.vm(installedVersion: "1.1.0")
                 try f.checkedUpdate(vm)
-                vm.installUpdate(confirmed: true)
-                try expect(!vm.updateAvailable && !vm.canInstallUpdate && f.updateCalls == ["check"], "无可用新版时不得执行更新")
+                vm.installUpdate(confirmed: false)
+                try expect(!vm.updateAvailable && vm.canInstallUpdate && f.updateCalls == ["check"], "同版允许用户显式校验组件，取消后不得准备或替换")
                 try expect(vm.updateText == "已经是最新版本", "最新版本应显示组件确认的结果")
+            case "update_repair_current_components":
+                try f.updateResponse("check", state: "current", message: "当前App已是最新正式版本，可校验配套组件")
+                let vm = f.vm(installedVersion: "1.1.0")
+                var restarted = false
+                vm.onUpdateRestartReady = { restarted = true }
+                try f.checkedUpdate(vm)
+                try expect(!vm.updateAvailable && vm.canInstallUpdate, "App同版不能冒充发现新版，但必须允许显式修复旧核心或探针")
+                vm.installUpdate(confirmed: true)
+                try expect(vm.installingUpdate && vm.isBusy && !vm.canQuit, "同版组件修复必须使用与更新相同的互斥和退出保护")
+                try spin { restarted }
+                try expect(f.updateCalls == ["check", "prepare", "apply"], "同版修复须通过完整准备校验后再交接独立事务")
+                try expect(!vm.updateAvailable && vm.installedVersion == "1.1.0" && vm.canQuit, "修复组件不能伪称发现新版或改变实际App版本")
+                try expect(f.calls.isEmpty, "组件修复不得绕过独立校验组件调用旧核心更新")
             case "update_check_errors":
                 let vm = f.vm()
                 try f.checkedUpdate(vm)

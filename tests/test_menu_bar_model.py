@@ -26,7 +26,7 @@ SCENARIOS = (
     "bodyguard_search_operation_guard",
     "update_installed_version", "update_version_fetching_and_failure", "update_release_unavailable",
     "update_remote_version_validation",
-    "update_check_readonly", "update_check_current", "update_check_errors", "update_cancel",
+    "update_check_readonly", "update_check_current", "update_repair_current_components", "update_check_errors", "update_cancel",
     "update_check_serialized", "update_success_restart", "update_prepare_failures", "update_apply_failure",
     "update_prepare_current", "update_operation_serialized", "update_busy_guard", "update_guard_application",
     "update_monitor_late_sample", "update_acknowledge", "update_missing_component",

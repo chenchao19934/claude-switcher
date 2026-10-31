@@ -631,15 +631,18 @@ final class VM: ObservableObject {
     }
 
     var canInstallUpdate: Bool {
-        updateAvailable && !checkingUpdate && !installingUpdate && !isBusy && !settingsBusy && canMonitor()
+        latestVersionState == .known && Self.isReleaseVersion(updateVersion)
+            && !checkingUpdate && !installingUpdate && !isBusy && !settingsBusy && canMonitor()
     }
 
     func requestInstallUpdate() {
         guard canInstallUpdate else { return }
         let alert = NSAlert()
-        alert.messageText = "更新 Claude 切换器并重启？"
-        alert.informativeText = "将下载、校验并更新 App、核心脚本和检测探针，保留账号、检查设置及地区配置。准备完成后切换器会退出并重启；校验或安全检查失败会中止，替换或启动失败会自动回滚。系统守护组件不会被替换。"
-        alert.addButton(withTitle: "更新并重启")
+        alert.messageText = updateAvailable ? "更新 Claude 切换器并重启？" : "校验并修复当前版本组件？"
+        alert.informativeText = updateAvailable
+            ? "将下载、校验并更新 App、核心脚本和检测探针，保留账号、检查设置及地区配置。准备完成后切换器会退出并重启；校验或安全检查失败会中止，替换或启动失败会自动回滚。系统守护组件不会被替换。"
+            : "会下载同一正式版并校验 App、核心脚本和检测探针，只在组件不一致时替换。保留账号、检查设置及地区配置；校验或安全检查失败会中止，替换或启动失败会自动回滚。系统守护组件不会被替换。"
+        alert.addButton(withTitle: updateAvailable ? "更新并重启" : "校验并修复")
         alert.addButton(withTitle: "取消")
         installUpdate(confirmed: alert.runModal() == .alertFirstButtonReturn)
     }
@@ -1427,7 +1430,7 @@ struct UpdateControls: View {
             HStack(spacing: 12) {
                 Button(vm.checkingUpdate ? "正在检查…" : "重新检查") { vm.checkUpdate() }
                     .disabled(vm.checkingUpdate || vm.isBusy || vm.settingsBusy)
-                Button(vm.installingUpdate ? "正在更新…" : "更新并重启") { vm.requestInstallUpdate() }
+                Button(vm.installingUpdate ? "正在更新…" : (vm.updateAvailable ? "更新并重启" : "校验并修复组件")) { vm.requestInstallUpdate() }
                     .buttonStyle(.borderedProminent)
                     .tint(ClaudeTheme.terracottaDeep)
                     .disabled(!vm.canInstallUpdate)
