@@ -1,6 +1,7 @@
 """Exercise release shell steps with temporary assets and a fake gh client.
 
-The real workflow remains tag-triggered. No build, Git tag, remote API or release
+The real workflow accepts tag pushes or manual runs on existing tags. No build,
+Git tag, remote API or release
 mutation is performed by these tests; Ruby's bundled YAML parser reads the same
 workflow that Actions will execute.
 """
@@ -49,7 +50,7 @@ class ReleasePipelineTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         (self.root / "build").mkdir()
-        self.env = dict(os.environ, VERSION=VERSION, RELEASE_TAG="v" + VERSION,
+        self.env = dict(os.environ, VERSION=VERSION, RELEASE_TAG="v" + VERSION, RELEASE_REF_TYPE="tag",
                         GITHUB_OUTPUT=str(self.root / "github-output"))
 
     def script(self, job, name):
@@ -86,8 +87,10 @@ class ReleasePipelineTests(unittest.TestCase):
     def calls(self):
         return [json.loads(line) for line in (self.root / "gh-calls").read_text().splitlines()]
 
-    def test_only_tag_push_can_publish_and_full_architecture_matrix_is_required(self):
-        self.assertEqual(self.workflow["on"], {"push": {"tags": ["v*"]}})
+    def test_tag_push_or_existing_tag_dispatch_requires_full_architecture_matrix(self):
+        self.assertEqual(self.workflow["on"], {"push": {"tags": ["v*"]}, "workflow_dispatch": None})
+        validator = next(step for step in self.workflow["jobs"]["validate"]["steps"] if step["id"] == "version")
+        self.assertEqual(validator["env"]["RELEASE_REF_TYPE"], "${{ github.ref_type }}")
         jobs = self.workflow["jobs"]
         build = jobs["macos"]
         self.assertEqual(set(build["needs"]), {"validate", "verify"})
@@ -143,6 +146,26 @@ class ReleasePipelineTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(output.exists(), "Invalid tags must not emit a version for downstream jobs")
                 self.assertFalse((self.root / "injected").exists())
+
+    def test_manual_dispatch_requires_existing_tag_even_for_semver_named_branches(self):
+        for ref_type, ref_name in (("branch", "main"), ("branch", "v1.2.3"),
+                                   ("", "v1.2.3"), ("tag\n", "v1.2.3")):
+            with self.subTest(ref_type=ref_type, ref_name=ref_name):
+                output = self.root / "github-output"
+                output.unlink(missing_ok=True)
+                result = self.run_step("validate", "Resolve version from tag",
+                                       dict(self.env, GITHUB_EVENT_NAME="workflow_dispatch",
+                                            RELEASE_REF_TYPE=ref_type, RELEASE_TAG=ref_name))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists(), "Branch dispatch must not emit a release version")
+        for event in ("push", "workflow_dispatch"):
+            with self.subTest(event=event):
+                output = self.root / "github-output"
+                output.unlink(missing_ok=True)
+                result = self.run_step("validate", "Resolve version from tag",
+                                       dict(self.env, GITHUB_EVENT_NAME=event))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(output.read_text(), "version=" + VERSION + "\n")
 
     def test_checksum_manifest_covers_both_architectures_and_all_platforms(self):
         manifest = self.manifest()

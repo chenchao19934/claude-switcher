@@ -937,6 +937,7 @@ struct MenuBarModelTests {
                 try spin { delegate.statusItem?.button?.title.contains("未通过") == true }
                 try expect(delegate.mainWindow?.isVisible == false, "隐窗时后台失败应同步菜单栏且不强制弹窗")
                 vm.stopMonitoring()
+                try spin { !vm.monitorInFlight }
                 let stoppedCount = f.calls.filter { $0 == "monitor-status" }.count
                 try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=ok\n")
                 pump(0.4)
