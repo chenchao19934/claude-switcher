@@ -1011,7 +1011,11 @@ if [ "${1:-}" = "monitor-status" ]; then
     exit 0
 fi
 
-mkdir -p "$BASE/accounts"
+# 更新检查必须保持只读；实际更新自行初始化并持有共享更新锁。
+case "${1:-}" in
+    update|update-check) ;;
+    *) mkdir -p "$BASE/accounts" ;;
+esac
 
 # 单文件内嵌 Python 的隔离入口;策略从 WEBRTC_POLICY 或持久化文件读取。
 clash_rules() {
@@ -1777,109 +1781,373 @@ ASEOF
     echo "OK:region=$ctry tz=$ntz locale=$nlocale source=$src"
 }
 
-# 自动更新:拉取 main 分支最新代码,SHA256 校验+配置注入+自检+失败回滚
-# --check 只检查不写入;--auto 供 LaunchAgent 每12小时调用(静默写 update.log)
+# 自动更新固定到同一提交；只读检查不初始化账号/日志/锁。
+# 配置以原脚本的完整赋值行复制，禁止 eval 或通过 sed 插入值。
 self_update() {
-    auto=0; check=0
-    case "${1:-}" in
-        --auto) auto=1 ;;
-        --check) check=1 ;;
-    esac
-    # 路径全部从脚本自身位置推导,兼容旧版 LaunchDaemon(root) 混跑时 $HOME 不可靠的场景
-    BIN=$(cd "$(dirname "$0")" && pwd)
-    UHOME="${BIN%/.local/bin}"
-    [ "$UHOME" = "$BIN" ] && UHOME="$HOME"
-    if [ "$auto" -eq 1 ]; then
-        mkdir -p "$BASE"
-        exec >>"$BASE/update.log" 2>&1
-        echo "# $(date '+%F %T') update --auto 开始"
-    fi
+    exec "${CLAUDE_SWITCHER_PYTHON:-python3}" -I -B - "$0" "${1:-}" <<'PY_CORE_UPDATE'
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import pwd
+import re
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+import zipfile
 
-    tmpd=$(mktemp -d)
-    if ! curl -sL --max-time 30 "https://codeload.github.com/YOURSJEYO/claude-switcher/zip/refs/heads/main" -o "$tmpd/main.zip" \
-        || ! unzip -q "$tmpd/main.zip" -d "$tmpd" 2>/dev/null; then
-        echo "FAIL:下载或解压失败(网络问题,稍后再试)"; rm -rf "$tmpd"; return 1
-    fi
-    NEW="$tmpd/claude-switcher-main"
-    if [ ! -f "$NEW/core/claude-switch.sh" ]; then
-        echo "FAIL:远程包结构异常,已中止"; rm -rf "$tmpd"; return 1
-    fi
+REPOSITORY = "chenchao19934/claude-switcher"
+CONFIG = ("PROXY_MODE", "PROXY_GROUP", "COUNTRY_TARGET", "TZ_TARGET", "LOCALE_TARGET")
+KEYS = {"代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
+        "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性"}
+OPTIONAL = {"IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性"}
+ARTIFACTS = ("core/claude-switch.sh", "core/stun-probe.py", "core/desktop-update.py")
 
-    # 工件完整性校验:逐项比对仓库 SHA256SUMS,任一不符即中止(防传输篡改;信任根为 GitHub 仓库本身)
-    if ! curl -sL --max-time 15 "https://raw.githubusercontent.com/YOURSJEYO/claude-switcher/main/SHA256SUMS" -o "$tmpd/SHA256SUMS" \
-        || [ ! -s "$tmpd/SHA256SUMS" ]; then
-        echo "FAIL:无法获取校验清单(SHA256SUMS),已中止"; rm -rf "$tmpd"; return 1
-    fi
-    bad=0
-    while read -r sum rel; do
-        [ -z "$sum" ] && continue
-        if [ ! -f "$NEW/$rel" ] || [ "$(shasum -a 256 "$NEW/$rel" | awk '{print $1}')" != "$sum" ]; then
-            bad=1; break
-        fi
-    done < "$tmpd/SHA256SUMS"
-    if [ "$bad" -eq 1 ]; then
-        echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; rm -rf "$tmpd"; return 1
-    fi
+class UpdateError(Exception):
+    pass
 
-    # 跳过判断:剔除头部5个配置行后与本地已安装版本比对,无差异即已是最新
-    strip_cfg() { grep -vE '^(PROXY_MODE|PROXY_GROUP|COUNTRY_TARGET|TZ_TARGET|LOCALE_TARGET)="' "$1"; }
-    if [ -f "$BIN/claude-switch.sh" ] && \
-       diff <(strip_cfg "$BIN/claude-switch.sh") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
-        echo "OK:已是最新版本"; rm -rf "$tmpd"; return 0
-    fi
+def fail(message):
+    raise UpdateError(message)
 
-    # 只读检查:不备份、不写文件、不物化守护脚本、不触发自检/回滚
-    if [ "$check" -eq 1 ]; then
-        stamp=$(stat -f '%Sm' -t '%Y-%m-%d' "$NEW/core/claude-switch.sh" 2>/dev/null)
-        [ -z "$stamp" ] && stamp=$(date '+%F')
-        echo "INFO:发现新版本 $stamp"
-        rm -rf "$tmpd"; return 0
-    fi
+def interrupted(signum, frame):
+    fail("更新已中断")
 
-    # 备份现有核心脚本
-    [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
+signal.signal(signal.SIGTERM, interrupted)
+signal.signal(signal.SIGINT, interrupted)
 
-    # 替换核心脚本 + 从 .bak 读出5个配置值注入新脚本
-    cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"
-    PM=""; PG=""; CT=""; TZV=""; LCT=""
-    if [ -f "$BIN/claude-switch.sh.bak" ]; then
-        get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh.bak" | head -1 | cut -d'"' -f2; }
-        PM=$(get_cfg PROXY_MODE); PG=$(get_cfg PROXY_GROUP); CT=$(get_cfg COUNTRY_TARGET)
-        TZV=$(get_cfg TZ_TARGET); LCT=$(get_cfg LOCALE_TARGET)
-        inject_cfg() { grep -q "^$1=\"" "$BIN/claude-switch.sh.bak" && sed -i '' "s|^$1=\".*\"|$1=\"$2\"|" "$BIN/claude-switch.sh"; }
-        inject_cfg PROXY_MODE "$PM"; inject_cfg PROXY_GROUP "$PG"; inject_cfg COUNTRY_TARGET "$CT"
-        inject_cfg TZ_TARGET "$TZV"; inject_cfg LOCALE_TARGET "$LCT"
-    fi
-    chmod +x "$BIN/claude-switch.sh"
+def safe_path(value):
+    if (not value or "\\" in value or value.startswith("/")
+            or any(part in ("", ".", "..") for part in value.split("/"))):
+        fail("远程包或清单含不安全路径，已中止")
+    return PurePosixPath(value)
 
-    # 守护进程脚本(root 所有,用户态不可写):与远程模板比对,有差异只提示不自动改
-    APPDIR="/Library/Application Support/claude-switcher"
-    if [ -f "$APPDIR/claude-bodyguard.sh" ] || [ -f "$APPDIR/tz-watchdog.sh" ]; then
-        [ -z "$PM" ] && PM="clash-verge"
-        [ -z "$TZV" ] && TZV="America/New_York"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__PROXY_MODE__|$PM|g" "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
-        if ! diff -q "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh" >/dev/null 2>&1 || \
-           ! diff -q "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh" >/dev/null 2>&1; then
-            echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
-        fi
-    fi
-    rm -rf "$tmpd"
+def proxy_environment():
+    env = dict(os.environ)
+    http_proxy = env.get("http_proxy") or env.get("HTTP_PROXY")
+    if http_proxy and not any(env.get(key) for key in ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")):
+        # curl 不会自动把 HTTP_PROXY 用于 HTTPS；显式转为 CONNECT 代理。
+        env["https_proxy"] = http_proxy
+    if any(env.get(key) for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")):
+        return env
+    try:
+        result = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return env
+    values = dict(re.findall(r"^\s*(HTTPSEnable|HTTPSProxy|HTTPSPort|HTTPEnable|HTTPProxy|HTTPPort)\s*:\s*(.*?)\s*$", result.stdout, re.M))
+    for prefix, variable in (("HTTP", "http_proxy"), ("HTTPS", "https_proxy")):
+        host, port = values.get(prefix + "Proxy", ""), values.get(prefix + "Port", "")
+        if (values.get(prefix + "Enable") == "1" and re.fullmatch(r"[A-Za-z0-9.:\[\]_-]+", host)
+                and port.isdigit() and 1 <= int(port) <= 65535):
+            if ":" in host and not host.startswith("["):
+                host = "[" + host + "]"
+            env[variable] = "http://" + host + ":" + port
+    # 系统仅启用 HTTP 代理时，同一 HTTP CONNECT 入口也供 HTTPS 下载使用。
+    if "https_proxy" not in env and "http_proxy" in env:
+        env["https_proxy"] = env["http_proxy"]
+    return env
 
-    # 更新后自检:root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
-    if [ "$(id -u)" -eq 0 ]; then
-        owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
-        if [ -n "$owner" ]; then out=$(sudo -H -u "$owner" "$BIN/claude-switch.sh" checkdetail 2>&1); else out=""; fi
-    else
-        out=$("$BIN/claude-switch.sh" checkdetail 2>&1)
-    fi
-    if [ -z "$out" ] || echo "$out" | grep -q '=fail'; then
-        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
-        echo "FAIL:新版自检未通过,已自动回滚"
-        return 1
-    fi
-    echo "OK:更新完成 $(date '+%Y-%m-%d')"
-    return 0
+def download(url, path, env, label, limit=1024 * 1024):
+    command = ["curl", "-fLsS", "--proto", "=https", "--proto-redir", "=https", "--max-filesize", str(limit), "--retry", "2", "--retry-delay", "1", "--retry-max-time", "60",
+               "--connect-timeout", "10", "--max-time", "30", "--output", str(path),
+               "--write-out", "%{http_code}", url]
+    try:
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=100)
+    except subprocess.TimeoutExpired:
+        fail(label + "超时，已中止")
+    except OSError:
+        fail("无法启动下载工具 curl，已中止")
+    if result.returncode:
+        if result.returncode == 22:
+            code = result.stdout.strip()
+            detail = "HTTP " + code if re.fullmatch(r"[1-5][0-9]{2}", code) else "HTTP 请求失败"
+        elif result.returncode == 28:
+            detail = "连接或下载超时"
+        elif result.returncode in (35, 51, 53, 54, 58, 59, 60, 64, 66, 77, 80, 82, 83, 90, 91):
+            detail = "TLS 握手或证书验证失败"
+        elif result.returncode == 6:
+            detail = "DNS 解析失败"
+        elif result.returncode == 7:
+            detail = "连接失败，请检查代理"
+        else:
+            detail = "下载失败（curl 退出码 " + str(result.returncode) + "）"
+        fail(label + "：" + detail + "，已中止")
+    if result.stdout.strip() != "200":
+        fail(label + "未返回 HTTP 200，已中止")
+    if not path.is_file() or path.stat().st_size == 0:
+        fail(label + "返回空内容，已中止")
+    if path.stat().st_size > limit:
+        fail(label + "超过大小限制，已中止")
+
+def verified_source(directory, env):
+    revision_file = directory / "revision.json"
+    download("https://api.github.com/repos/" + REPOSITORY + "/commits/main", revision_file, env, "获取更新版本")
+    try:
+        revision = json.loads(revision_file.read_text(encoding="utf-8"))["sha"]
+    except (OSError, ValueError, KeyError, TypeError):
+        fail("更新版本响应无效，已中止")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        fail("更新版本不是有效提交，已中止")
+    archive, manifest = directory / "source.zip", directory / "SHA256SUMS"
+    download("https://codeload.github.com/" + REPOSITORY + "/zip/" + revision, archive, env, "下载更新包", limit=128 * 1024 * 1024)
+    download("https://raw.githubusercontent.com/" + REPOSITORY + "/" + revision + "/SHA256SUMS", manifest, env, "下载校验清单")
+    unpacked = directory / "source"
+    unpacked.mkdir()
+    prefix = "claude-switcher-" + revision
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            entries = bundle.infolist()
+            if len(entries) > 20000 or sum(info.file_size for info in entries) > 512 * 1024 * 1024:
+                fail("远程包大小异常，已中止")
+            seen = set()
+            for info in entries:
+                name = info.filename.rstrip("/")
+                path = safe_path(name)
+                kind = stat.S_IFMT(info.external_attr >> 16)
+                if path.parts[0] != prefix or name in seen or kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                    fail("远程包路径、文件类型或重复项异常，已中止")
+                seen.add(name)
+            bundle.extractall(unpacked)
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError):
+        fail("更新包解压失败或格式无效，已中止")
+    source = unpacked / prefix
+    hashes = {}
+    try:
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
+            if not match:
+                fail("校验清单格式无效，已中止")
+            checksum, relative = match.groups()
+            safe_path(relative)
+            if relative in hashes:
+                fail("校验清单存在重复项，已中止")
+            hashes[relative] = checksum.lower()
+        if not set(ARTIFACTS).issubset(hashes):
+            fail("校验清单缺少必需工件，已中止")
+        for relative, checksum in hashes.items():
+            path = source / relative
+            if not path.is_file() or path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
+                fail("工件 SHA256 校验失败，已中止")
+    except (OSError, UnicodeError):
+        fail("无法读取校验清单或工件，已中止")
+    return source, revision
+
+def configuration(text):
+    lines = {}
+    for line in text.splitlines(keepends=True):
+        for key in CONFIG:
+            if line.startswith(key + "="):
+                if key in lines:
+                    fail("本地或新版配置存在重复项，已中止")
+                lines[key] = line.rstrip("\r\n")
+    if set(lines) != set(CONFIG):
+        fail("本地或新版缺少配置项，已中止")
+    return lines
+
+def strip_configuration(text):
+    return "".join(line for line in text.splitlines(keepends=True)
+                   if not any(line.startswith(key + "=") for key in CONFIG))
+
+def inject_configuration(text, values):
+    configuration(text)
+    return "".join(values[line.split("=", 1)[0]] + "\n" if any(line.startswith(key + "=") for key in CONFIG)
+                   else line for line in text.splitlines(keepends=True))
+
+def atomic_write(path, data, mode=0o755):
+    owner = path.stat() if path.exists() else path.parent.stat()
+    descriptor, temporary = tempfile.mkstemp(prefix=".claude-update-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        if os.geteuid() == 0:
+            os.chown(temporary, owner.st_uid, owner.st_gid)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+def audited(core, home):
+    command = ["/bin/bash", str(core), "checkdetail"]
+    if os.geteuid() == 0 and home.stat().st_uid != 0:
+        command = ["sudo", "-H", "-u", pwd.getpwuid(home.stat().st_uid).pw_name] + command
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=90)
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        return False
+    states = {}
+    for line in result.stdout.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        state = value.split(":", 1)[0]
+        if (not separator or key not in KEYS or key in states or state not in ("ok", "warn", "skip")
+                or (state != "ok" and key not in OPTIONAL)):
+            return False
+        states[key] = state
+    return result.returncode == 0 and set(states) == KEYS
+
+def daemon_notice(source, home, values):
+    managed = Path("/Library/Application Support/claude-switcher")
+    try:
+        parsed = {key: shlex.split(line, comments=True)[0].split("=", 1)[1] for key, line in values.items()}
+        for name in ("claude-bodyguard.sh", "tz-watchdog.sh"):
+            installed = managed / name
+            if installed.is_file():
+                template = source / "daemons" / name
+                expected = template.read_text().replace("__HOME__", str(home)).replace("__PROXY_MODE__", parsed["PROXY_MODE"]).replace("__TZ_TARGET__", parsed["TZ_TARGET"])
+                if expected != installed.read_text():
+                    print("INFO:守护进程脚本有更新，请运行 installer/安装.command 刷新（需要密码）")
+                    return
+    except (OSError, ValueError, IndexError):
+        print("INFO:守护进程模板未确认一致，可运行安装器核对；本次未修改系统组件")
+
+def update(source, core, base, home):
+    destinations = (core, base / "stun-probe.py", base / "desktop-update.py")
+    for destination in destinations:
+        backup = Path(str(destination) + ".bak")
+        if destination.is_symlink() or backup.is_symlink() or (destination.exists() and not destination.is_file()):
+            fail("本地工件路径异常，已中止")
+    values = configuration(core.read_text(encoding="utf-8"))
+    content = [inject_configuration((source / ARTIFACTS[0]).read_text(encoding="utf-8"), values).encode("utf-8")]
+    content += [(source / relative).read_bytes() for relative in ARTIFACTS[1:]]
+    candidate = source / "core/claude-switch.configured.sh"
+    candidate.write_bytes(content[0])
+    try:
+        syntax = subprocess.run(["/bin/bash", "-n", str(candidate)], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        fail("无法确认新版脚本语法，已中止")
+    if syntax.returncode:
+        fail("新版脚本语法检查失败，已中止")
+    originals = {path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) if path.exists() else None for path in destinations}
+    touched = []
+    try:
+        for path, original in originals.items():
+            if original is not None:
+                atomic_write(Path(str(path) + ".bak"), original[0], original[1])
+        for path, data in zip(destinations, content):
+            touched.append(path)
+            atomic_write(path, data)
+        if not audited(core, home):
+            fail("新版自检未通过")
+    except (OSError, UpdateError):
+        recovered = True
+        for path in reversed(touched):
+            try:
+                original = originals[path]
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, original[0], original[1])
+            except OSError:
+                recovered = False
+        fail("新版写入或自检失败，已自动回滚全部工件" if recovered else "更新失败且回滚未完整完成，请使用 .bak 备份恢复")
+    daemon_notice(source, home, values)
+
+def require_plain(path, directory=False):
+    for current in (path, *path.parents):
+        if current.is_symlink():
+            fail("本地更新路径含符号链接，已中止")
+        if current.exists() and current != path and not current.is_dir():
+            fail("本地更新父路径不是目录，已中止")
+    if path.exists() and not (path.is_dir() if directory else path.is_file()):
+        fail("本地更新目标类型异常，已中止")
+
+def main():
+    core = Path(sys.argv[1]).absolute()
+    option = sys.argv[2]
+    if option not in ("", "--auto", "--check"):
+        fail("更新参数无效，请使用 update [--check|--auto]")
+    home = core.parent.parent.parent if core.parent.name == "bin" and core.parent.parent.name == ".local" else Path.home()
+    base = home / ".claude-switcher"
+    check = option == "--check"
+    if not check and os.geteuid() == 0:
+        fail("核心更新不再以 root 写入用户目录，请重新运行安装器改用用户态 LaunchAgent")
+    require_plain(base, directory=True)
+    for target in (core, base / "stun-probe.py", base / "desktop-update.py"):
+        require_plain(target)
+        require_plain(Path(str(target) + ".bak"))
+    lock = base / ".update.lock"
+    nonce = uuid.uuid4().hex
+    acquired = False
+    lock_ready = False
+    lock_identity = None
+    created_files = {}
+    log_handle = None
+    try:
+        if not check:
+            base.mkdir(parents=True, exist_ok=True)
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+            try:
+                try:
+                    lock.mkdir(mode=0o700)
+                    acquired = True
+                    lock_identity = (lock.stat().st_dev, lock.stat().st_ino)
+                except FileExistsError:
+                    fail("已有更新任务或待确认更新锁，请稍后重试；未清理现有锁")
+                for name, value in (("pid", str(os.getpid())), ("nonce", nonce)):
+                    descriptor = os.open(lock / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    metadata = os.fstat(descriptor)
+                    created_files[name] = (metadata.st_dev, metadata.st_ino)
+                    with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+                        handle.write(value + "\n")
+                lock_ready = True
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if option == "--auto":
+                log_handle = (base / "update.log").open("a", encoding="utf-8")
+                sys.stdout = log_handle
+                print("# update --auto 开始", flush=True)
+        env = proxy_environment()
+        with tempfile.TemporaryDirectory(prefix="claude-core-update-") as temporary:
+            source, revision = verified_source(Path(temporary), env)
+            old = core.read_text(encoding="utf-8")
+            new = (source / ARTIFACTS[0]).read_text(encoding="utf-8")
+            configuration(old); configuration(new)
+            destinations = (core, base / "stun-probe.py", base / "desktop-update.py")
+            equal = strip_configuration(old) == strip_configuration(new) and all(
+                path.is_file() and not path.is_symlink() and path.read_bytes() == (source / relative).read_bytes()
+                for path, relative in zip(destinations[1:], ARTIFACTS[1:]))
+            if equal:
+                print("OK:核心及配套脚本已是最新版本")
+            elif check:
+                print("INFO:发现新版核心及配套脚本（提交 " + revision[:12] + "）")
+            else:
+                update(source, core, base, home)
+                print("OK:核心及配套脚本更新完成（提交 " + revision[:12] + "）")
+            print("INFO:本命令不更换 App；新版界面请使用界面中的更新 App 功能")
+    except (OSError, UnicodeError) as error:
+        fail("更新文件处理失败，已中止（" + type(error).__name__ + "）")
+    finally:
+        if acquired:
+            try:
+                metadata = lock.lstat()
+                same_lock = stat.S_ISDIR(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == lock_identity
+                owned = not lock_ready or ((lock / "pid").read_text().strip() == str(os.getpid())
+                                          and (lock / "nonce").read_text().strip() == nonce)
+                if same_lock and owned:
+                    for name, identity in created_files.items():
+                        metadata = (lock / name).lstat()
+                        if stat.S_ISREG(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == identity:
+                            (lock / name).unlink()
+                    lock.rmdir()
+            except OSError:
+                pass
+        if log_handle:
+            log_handle.flush()
+
+try:
+    main()
+except UpdateError as error:
+    print("FAIL:" + str(error), flush=True)
+    raise SystemExit(1)
+PY_CORE_UPDATE
 }
 
 # 设备指纹体检:字体地区特征 + GPU/虚拟机特征(Canvas/WebGL 由 Web 检测页覆盖)
@@ -2422,7 +2690,7 @@ case "$operation" in
 esac
 rc=$?
 case "$operation" in
-    get-check-config|set-check-config|export-diagnostics) ;;
+    get-check-config|set-check-config|export-diagnostics|update|update-check) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
 esac
 exit "$rc"

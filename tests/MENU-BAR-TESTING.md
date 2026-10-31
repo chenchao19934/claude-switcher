@@ -12,7 +12,7 @@ python3 -m unittest discover -s tests -v
 
 `MenuBarFixture.swift` 与生产应用共用 `SwitcherMenu`、`AppDelegate` 和 `QuickPanelView`，仅把核心脚本注入为明确指定的假脚本。未提供脚本路径时拒绝启动；不会回退到 `~/.local/bin/claude-switch.sh`。
 
-演示程序额外提供「菜单内容预览」辅助操作入口和「演示外观」菜单。辅助菜单用于自动化工具呼出面板，不代表已验证原生状态栏右键菜单布局。启动时会输出原生状态栏按钮数量、模板图像属性和辅助功能名称，供检查图标驻留与可访问性。辅助功能属性检查不等于完整的 VoiceOver 语音验收。
+演示程序额外提供「菜单内容预览」辅助操作入口和「演示外观」菜单。辅助菜单用于自动化工具呼出面板，不代表已验证原生状态栏右键菜单布局。启动时会输出原生状态栏按钮数量、模板图像属性和辅助功能名称，供检查图标驻留与可访问性。辅助功能属性检查不等于完整的 VoiceOver 语音验收。假核心同目录必须有 `macos-dev-updater.sh`，且显式注入为更新后端；模拟更新停在准备阶段，不执行安装或真正重启。
 
 推荐入口：`bash scripts/dev-macos.sh run --hotkey`。它构建独立演示 App，使用仓库假核心；快捷键偏好仅存内存，退出时释放注册，不写正式用户偏好或 Widget 共享容器。省略 `--hotkey` 不注册全局组合。以下仍保留手工编译示例。
 
@@ -42,6 +42,7 @@ case "$1" in
   *) exit 2 ;;
 esac
 SH
+cp tests/fixtures/macos-dev-updater.sh _trash/menu-bar-demo/macos-dev-updater.sh
 
 _trash/menu-bar-demo/MenuBarFixture "$PWD/_trash/menu-bar-demo/fake-core.sh"
 # 深色外观（只改变演示应用自身）：
@@ -61,6 +62,7 @@ _trash/menu-bar-demo/MenuBarFixture "$PWD/_trash/menu-bar-demo/fake-core.sh"
 9. 导出诊断时，系统保存对话框与结果提示不会导致面板意外收起；含跳过的摘要与检查行保持灰色，不计作通过。
 10. 通知中心 Widget 的正式签名、共享容器、系统注册及点击验收按 [MACOS-WIDGET.md](../docs/MACOS-WIDGET.md) 单独执行；编译和模型回归不能替代该项。
 11. 用假核心模拟 TUN 或内核掉线：面板隐藏时菜单栏也应自动显示失败，再次呼出时详情一致；模拟恢复后必须重新完整审计，审计失败不能显示通过。模拟监测超时、无效输出、操作繁忙与唤醒补查，确认没有重叠采样或旧结果覆盖新操作。测试不得关闭真实 TUN 或启动真实 Claude。
+12. 在「版本更新」检查模拟版本，确认后端只收到 `check`；取消确认不得触发准备更新。确认模拟更新后应显示演示提示，面板恢复可操作；用模型测试覆盖准备失败、错误协议、重启握手和保镖应用互斥。真实已安装 App 的更新与回滚只能在用户明确授权后验收。
 
 App 的轻量采样目标周期固定为 10 秒，不受保镖的 2–10 秒配置影响；它不定时执行完整网络审计。小组件只请求系统刷新，不以菜单栏更新速度作为 WidgetKit 的实时保证。
 

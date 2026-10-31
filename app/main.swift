@@ -25,6 +25,13 @@ struct CoreResult {
     let succeeded: Bool
 }
 
+private struct DesktopUpdateReply: Decodable {
+    let state: String
+    let version: String?
+    let message: String
+    let token: String?
+}
+
 struct AccountStamp: Equatable {
     let size: String
     let date: String
@@ -79,6 +86,10 @@ final class VM: ObservableObject {
     }
     @Published private(set) var lastCheckSummary = "尚未检查"
     @Published var updateText = ""
+    @Published private(set) var checkingUpdate = false
+    @Published private(set) var installingUpdate = false
+    @Published private(set) var updateAvailable = false
+    @Published private(set) var updateVersion = ""
     @Published var showUpdateSheet = false
     @Published private(set) var coreMissing = false
     @Published private(set) var currentClient = ""
@@ -120,22 +131,32 @@ final class VM: ObservableObject {
     private var operationGeneration: UInt = 0
     private var started = false
     private var switchRequested = false
-    private var checkingUpdate = false
+    private let updateCommand: [String]?
+    private let applicationPath: String
+    private var updateRestartRequested = false
     private var hideAfterSwitch: DispatchWorkItem?
     var onSwitchCompleted: (() -> Void)?
+    var onUpdateRestartReady: (() -> Void)?
     var canMonitor: () -> Bool = { true }
 
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
          checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180,
-         monitorInterval: TimeInterval? = 10, monitorTimeout: TimeInterval = 3) {
+         monitorInterval: TimeInterval? = 10, monitorTimeout: TimeInterval = 3,
+         updateCommand: [String]? = nil, applicationPath: String = Bundle.main.bundlePath) {
         self.core = core
         self.checkTimeout = checkTimeout
         self.operationTimeout = operationTimeout
         self.monitorInterval = monitorInterval
         self.monitorTimeout = monitorTimeout
+        self.applicationPath = applicationPath
+        self.updateCommand = updateCommand ?? Bundle.main.path(forResource: "desktop-update", ofType: "py")
+            .map { ["/usr/bin/python3", "-I", "-B", $0] }
     }
 
-    var canQuit: Bool { !switchRequested && phase != .fixing && phase != .switching }
+    var canQuit: Bool {
+        !switchRequested && phase != .fixing && phase != .switching
+            && (!installingUpdate || updateRestartRequested)
+    }
 
     func start() {
         guard !started else { return }
@@ -225,6 +246,11 @@ final class VM: ObservableObject {
     }
 
     private func run(_ args: [String], timeout: TimeInterval = 45, done: @escaping (CoreResult) -> Void) {
+        execute(["/bin/bash", core] + args, timeout: timeout, done: done)
+    }
+
+    private func execute(_ command: [String], timeout: TimeInterval,
+                         rawFailure: Bool = false, done: @escaping (CoreResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-out-\(UUID().uuidString).txt")
             guard FileManager.default.createFile(atPath: tmp.path, contents: nil, attributes: [.posixPermissions: 0o600]),
@@ -237,8 +263,8 @@ final class VM: ObservableObject {
                 try? FileManager.default.removeItem(at: tmp)
             }
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/bash")
-            p.arguments = [self.core] + args
+            p.executableURL = URL(fileURLWithPath: command[0])
+            p.arguments = Array(command.dropFirst())
             p.standardOutput = fh
             p.standardError = fh
             do { try p.run() } catch {
@@ -256,7 +282,7 @@ final class VM: ObservableObject {
             if deadline.timedOut {
                 result = CoreResult(output: "操作超时，请重试", succeeded: false)
             } else if p.terminationStatus != 0 {
-                result = CoreResult(output: "脚本执行失败（退出码 \(p.terminationStatus)）\n\(out)", succeeded: false)
+                result = CoreResult(output: rawFailure ? out : "脚本执行失败（退出码 \(p.terminationStatus)）\n\(out)", succeeded: false)
             } else {
                 result = CoreResult(output: out, succeeded: true)
             }
@@ -551,15 +577,109 @@ final class VM: ObservableObject {
     }
 
     func checkUpdate() {
-        guard !checkingUpdate else { return }
+        guard !checkingUpdate, !isBusy, !settingsBusy, canMonitor() else { return }
         checkingUpdate = true
+        updateAvailable = false
+        updateVersion = ""
         updateText = "正在检查更新…"
-        run(["update-check"], timeout: 120) { result in
-            self.updateText = result.output.isEmpty
-                ? (result.succeeded ? "检查完成，核心脚本没有返回结果" : "检查失败，请重试")
-                : result.output
+        runUpdate(["check"], timeout: 240) { result in
             self.checkingUpdate = false
+            guard let reply = self.updateReply(result, allowed: ["available", "current"]) else { return }
+            self.updateAvailable = reply.state == "available"
+            self.updateVersion = reply.version ?? ""
+            self.updateText = reply.message
         }
+    }
+
+    var canInstallUpdate: Bool {
+        updateAvailable && !checkingUpdate && !installingUpdate && !isBusy && !settingsBusy && canMonitor()
+    }
+
+    func requestInstallUpdate() {
+        guard canInstallUpdate else { return }
+        let alert = NSAlert()
+        alert.messageText = "更新 Claude 切换器并重启？"
+        alert.informativeText = "将下载、校验并更新 App、核心脚本和检测探针，保留账号、检查设置及地区配置。准备完成后切换器会退出并重启；校验或安全检查失败会中止，替换或启动失败会自动回滚。系统守护组件不会被替换。"
+        alert.addButton(withTitle: "更新并重启")
+        alert.addButton(withTitle: "取消")
+        installUpdate(confirmed: alert.runModal() == .alertFirstButtonReturn)
+    }
+
+    // 确认与执行分开，模型回归不弹窗，也不调用本机安装态。
+    func installUpdate(confirmed: Bool) {
+        guard confirmed, canInstallUpdate else { return }
+        installingUpdate = true
+        isBusy = true
+        updateRestartRequested = false
+        updateText = "正在下载、校验并准备更新…\n编译 App 和安全检查可能需要几分钟，请保持切换器运行。"
+        runUpdate(["prepare"], timeout: 600) { result in
+            guard let reply = self.updateReply(result, allowed: ["prepared", "current"]) else {
+                self.finishUpdateFailure(); return
+            }
+            if reply.state == "current" {
+                self.updateAvailable = false
+                self.updateText = reply.message
+                self.finishUpdateFailure()
+                return
+            }
+            guard let token = reply.token, UUID(uuidString: token) != nil else {
+                self.updateText = "更新组件未返回有效的更新凭据，未替换安装版本"
+                self.finishUpdateFailure(); return
+            }
+            self.updateText = "更新已准备，正在安排重启…"
+            self.runUpdate(["apply", "--token", token, "--pid", String(ProcessInfo.processInfo.processIdentifier)], timeout: 30) { result in
+                guard let reply = self.updateReply(result, allowed: ["restarting"]) else {
+                    self.finishUpdateFailure(); return
+                }
+                self.updateText = reply.message
+                self.updateRestartRequested = true
+                self.stopMonitoring()
+                self.onUpdateRestartReady?()
+            }
+        }
+    }
+
+    func acknowledgeUpdate(token: String) {
+        guard UUID(uuidString: token) != nil else { return }
+        runUpdate(["ack", "--token", token], timeout: 15) { result in
+            guard let reply = self.updateReply(result, allowed: ["updated"]) else {
+                self.showUpdateSheet = true; return
+            }
+            self.updateVersion = reply.version ?? ""
+            self.updateAvailable = false
+            self.updateText = reply.message
+            self.showUpdateSheet = true
+        }
+    }
+
+    private func finishUpdateFailure() {
+        installingUpdate = false
+        isBusy = false
+        updateRestartRequested = false
+    }
+
+    private func runUpdate(_ args: [String], timeout: TimeInterval, done: @escaping (CoreResult) -> Void) {
+        guard let command = updateCommand, !command.isEmpty else {
+            done(CoreResult(output: "当前 App 缺少更新组件，请先安装新版 App 后使用界面更新", succeeded: false))
+            return
+        }
+        execute(command + args + ["--app", applicationPath, "--core", core], timeout: timeout,
+                rawFailure: true, done: done)
+    }
+
+    private func updateReply(_ result: CoreResult, allowed: Set<String>) -> DesktopUpdateReply? {
+        guard let data = result.output.data(using: .utf8), data.count < 16384,
+              let reply = try? JSONDecoder().decode(DesktopUpdateReply.self, from: data) else {
+            updateText = result.output == "操作超时，请重试" ? "更新操作超时，请重试；未确认完成的更新不会显示成功"
+                : "更新组件未返回有效结果，请确认 App 更新组件已安装并重试"
+            if updateCommand == nil { updateText = "当前 App 缺少更新组件，请先安装新版 App 后使用界面更新" }
+            return nil
+        }
+        guard result.succeeded, allowed.contains(reply.state), !reply.message.isEmpty else {
+            updateText = reply.state == "error" && !reply.message.isEmpty ? reply.message : "更新操作未完成，请重试"
+            return nil
+        }
+        return reply
     }
 
     var aiPrompt: String {
@@ -1240,10 +1360,35 @@ struct FingerprintView: View {
 
 // MARK: - 版本更新
 
+struct UpdateControls: View {
+    @ObservedObject var vm: VM
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if !vm.updateVersion.isEmpty {
+                Text("版本标识：\(vm.updateVersion)")
+                    .font(.caption.monospaced()).foregroundColor(ClaudeTheme.muted)
+            }
+            HStack(spacing: 12) {
+                Button(vm.checkingUpdate ? "正在检查…" : "重新检查") { vm.checkUpdate() }
+                    .disabled(vm.checkingUpdate || vm.isBusy || vm.settingsBusy)
+                Button(vm.installingUpdate ? "正在更新…" : "更新并重启") { vm.requestInstallUpdate() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(ClaudeTheme.terracottaDeep)
+                    .disabled(!vm.canInstallUpdate)
+                if vm.checkingUpdate || vm.installingUpdate { ProgressView().controlSize(.small) }
+            }
+            Text("更新 App、核心脚本与检测探针；保留账号和配置。下载会使用系统代理，校验或安全检查失败会中止，替换或启动失败自动回滚。")
+                .font(.caption).foregroundColor(ClaudeTheme.muted)
+            Text("需要已安装的 Xcode 命令行工具；系统守护组件的升级会另行提示。")
+                .font(.caption2).foregroundColor(ClaudeTheme.muted)
+        }
+    }
+}
+
 struct UpdateSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var vm: VM
-    @State private var copied = false
 
     var body: some View {
         ZStack {
@@ -1252,7 +1397,7 @@ struct UpdateSheet: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("版本更新").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("只检查，不写入任何文件").font(.caption).foregroundColor(ClaudeTheme.muted)
+                        Text("检查版本后，由你确认更新并重启").font(.caption).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
@@ -1275,43 +1420,14 @@ struct UpdateSheet: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(ClaudeTheme.cardBorder))
 
-                HStack(spacing: 10) {
-                    Button { vm.checkUpdate() } label: {
-                        Label("重新检查", systemImage: "arrow.clockwise")
-                            .font(.callout.bold())
-                            .padding(.horizontal, 16).padding(.vertical, 7)
-                            .background(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .leading, endPoint: .trailing))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    Button { copyUpdateCommand() } label: {
-                        Label(copied ? "已复制" : "复制更新命令", systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .font(.callout.bold())
-                            .padding(.horizontal, 16).padding(.vertical, 7)
-                            .background(ClaudeTheme.iconWell)
-                            .foregroundColor(ClaudeTheme.ink)
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    Spacer()
-                }
-
-                Text("复制后到终端执行即可更新；更新前会做 SHA256 校验，自检不通过会自动回滚。")
-                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                UpdateControls(vm: vm)
             }
             .padding(20)
         }
-        .frame(width: 520, height: 300)
+        .frame(width: 540, height: 350)
         .preferredColorScheme(.light)
     }
 
-    private func copyUpdateCommand() {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        _ = pasteboard.setString("~/.local/bin/claude-switch.sh update", forType: .string)
-        copied = true
-    }
 }
 
 // MARK: - AI 交接提示词
@@ -1879,14 +1995,9 @@ struct QuickPanelView: View {
             }
             if !vm.banner.isEmpty { operationMessage }
         case .update:
-            detailIntro("检查新版本", subtitle: "只读检查核心版本，更新前仍需确认")
+            detailIntro("检查新版本", subtitle: "检查版本后，由你确认更新 App 与核心并重启")
             outputBox(vm.updateText.isEmpty ? "尚未检查" : vm.updateText)
-            HStack(spacing: 12) {
-                Button("重新检查") { vm.checkUpdate() }
-                Button(copied ? "已复制" : "复制更新命令") { copy("~/.local/bin/claude-switch.sh update") }
-            }
-            Text("更新命令在终端中执行，包含 SHA256 校验、备份和失败回滚。")
-                .font(.caption).foregroundColor(ClaudeTheme.muted)
+            UpdateControls(vm: vm)
         case .ai:
             detailIntro("交给本地 AI 配置", subtitle: "复制提示词，按仓库 AGENTS.md 安装与排障")
             outputBox(vm.aiPrompt)
@@ -2712,6 +2823,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
         vm.onSwitchCompleted = { [weak self] in self?.hidePanel() }
+        vm.onUpdateRestartReady = { NSApplication.shared.terminate(nil) }
         setupStatusItem()
         observeModel()
         localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -2735,6 +2847,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
         }
         showMainWindow()
         vm.start()
+        if let flag = CommandLine.arguments.firstIndex(of: "--update-token"),
+           CommandLine.arguments.indices.contains(flag + 1) {
+            vm.acknowledgeUpdate(token: CommandLine.arguments[flag + 1])
+        }
     }
 
     private func observeModel() {

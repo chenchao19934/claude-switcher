@@ -271,6 +271,7 @@ echo "✓ 地区格式: $LOCALE"
 mkdir -p "$H/.local/bin" "$H/.claude-switcher" "$H/Library/Logs"
 cp "$REPO/core/claude-switch.sh" "$H/.local/bin/"
 cp "$REPO/core/stun-probe.py" "$H/.claude-switcher/"
+cp "$REPO/core/desktop-update.py" "$H/.claude-switcher/" || { echo "✗ 缺少桌面更新组件,请重新下载完整安装包"; exit 1; }
 chmod +x "$H/.local/bin/claude-switch.sh"
 # 写入探测到的客户端/代理组名/地区目标
 sed -i '' \
@@ -331,6 +332,7 @@ mkdir -p "$H/Desktop"
 pkill -x ClaudeSwitcher 2>/dev/null
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$REPO/core/desktop-update.py" "$APP/Contents/Resources/desktop-update.py" || exit 1
 # 必须带 -target,否则新 SDK 编出的二进制在老系统被拒启动
 if swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
     "$REPO/app/main.swift" -o "$APP/Contents/MacOS/ClaudeSwitcher" \
@@ -353,6 +355,8 @@ if [ -f "$PNG" ]; then
     iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null \
         && echo "✓ 图标已生成" || echo "⚠️  图标生成失败(不影响使用)"
 fi
+APP_SOURCE_SHA=$(shasum -a 256 "$REPO/app/main.swift" | awk '{print $1}')
+APP_ICON_SHA=$(shasum -a 256 "$REPO/assets/icon-2048.png" | awk '{print $1}')
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -369,10 +373,14 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>LSUIElement</key><true/>
+	<key>ClaudeSwitcherAppSourceSHA256</key><string>$APP_SOURCE_SHA</string>
+	<key>ClaudeSwitcherIconSourceSHA256</key><string>$APP_ICON_SHA</string>
 </dict>
 </plist>
 EOF
-codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
+if ! codesign --force --deep -s - "$APP" >/dev/null 2>&1; then
+    echo "✗ App 签名失败,已停止安装"; exit 1
+fi
 echo "✓ App 已放到桌面"
 
 # ---- 5. 生成全局扩展脚本(仅 Clash Verge;保留已有 main 与无关配置) ----

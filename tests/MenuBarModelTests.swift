@@ -3,6 +3,7 @@ import AppKit
 import Carbon
 
 private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性"]
+private let updateToken = "00000000-0000-4000-8000-000000000001"
 
 private struct TestFailure: Error, CustomStringConvertible {
     let description: String
@@ -66,11 +67,13 @@ private final class GuardBackendFixture {
 private final class Fixture {
     let root: URL
     let core: URL
+    let updater: URL
 
     init() throws {
         let trash = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("_trash")
         root = trash.appendingPathComponent("menu-bar-model-\(UUID().uuidString)")
         core = root.appendingPathComponent("fake-core.sh")
+        updater = root.appendingPathComponent("fake-updater.sh")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try write("audit", auditKeys.map { "\($0)=ok" }.joined(separator: "\n") + "\n")
         try write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=ok\n")
@@ -96,6 +99,20 @@ private final class Fixture {
         esac
         """)
         try FileManager.default.moveItem(at: root.appendingPathComponent("core-script"), to: core)
+        try updateResponse("check", state: "available", message: "发现新版 abcdef123456")
+        try updateResponse("prepare", state: "prepared", message: "更新已准备", token: updateToken)
+        try updateResponse("apply", state: "restarting", message: "准备重启切换器")
+        try updateResponse("ack", state: "updated", message: "已更新并确认启动")
+        try write("fake-updater.sh", """
+        #!/bin/bash
+        root="$(cd "$(dirname "$0")" && pwd)"
+        printf '%s\\n' "$1" >> "$root/update-calls"
+        printf '%s\\n' "$@" >> "$root/update-arguments"
+        case "$1" in check|prepare|apply|ack) ;; *) exit 2 ;; esac
+        if [ -f "$root/update-$1-delay" ]; then /bin/sleep "$(cat "$root/update-$1-delay")"; fi
+        cat "$root/update-$1-output"
+        if [ -f "$root/update-$1-exit" ]; then exit "$(cat "$root/update-$1-exit")"; fi
+        """)
     }
 
     deinit { try? FileManager.default.removeItem(at: root) }
@@ -108,15 +125,36 @@ private final class Fixture {
         try write("audit", auditKeys.map { "\($0)=\(changes[$0] ?? "ok")" }.joined(separator: "\n") + "\n")
     }
 
+    func updateResponse(_ command: String, state: String, message: String,
+                        token: String? = nil, exit: Int = 0) throws {
+        var reply = ["state": state, "version": "abcdef123456", "message": message]
+        if let token = token { reply["token"] = token }
+        let data = try JSONSerialization.data(withJSONObject: reply, options: [.sortedKeys])
+        try write("update-\(command)-output", String(decoding: data, as: UTF8.self))
+        try write("update-\(command)-exit", String(exit))
+    }
+
     func vm(checkTimeout: TimeInterval = 2, operationTimeout: TimeInterval = 2,
             monitorInterval: TimeInterval? = nil, monitorTimeout: TimeInterval = 1) -> VM {
         VM(core: core.path, checkTimeout: checkTimeout, operationTimeout: operationTimeout,
-           monitorInterval: monitorInterval, monitorTimeout: monitorTimeout)
+           monitorInterval: monitorInterval, monitorTimeout: monitorTimeout,
+           updateCommand: ["/bin/bash", updater.path],
+           applicationPath: root.appendingPathComponent("Demo Switcher.app").path)
     }
 
     var calls: [String] {
         ((try? String(contentsOf: root.appendingPathComponent("calls"), encoding: .utf8)) ?? "")
             .split(separator: "\n").map(String.init)
+    }
+
+    var updateCalls: [String] {
+        ((try? String(contentsOf: root.appendingPathComponent("update-calls"), encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+    }
+
+    func checkedUpdate(_ vm: VM) throws {
+        vm.checkUpdate()
+        try spin { !vm.checkingUpdate }
     }
 
     func idle(_ vm: VM) throws { try spin { !vm.isBusy } }
@@ -576,6 +614,165 @@ struct MenuBarModelTests {
                 try f.idle(vm)
                 try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "手动快捷键收起与重开不能重复或中断修复")
                 delegate.hidePanel()
+            case "update_check_readonly":
+                let vm = f.vm()
+                try f.checkedUpdate(vm)
+                try expect(f.updateCalls == ["check"] && f.calls.isEmpty, "版本检查不得隐式准备、安装或执行核心更新")
+                try expect(vm.updateAvailable && vm.canInstallUpdate && vm.updateVersion == "abcdef123456", "有效新版应允许用户主动确认更新")
+                try expect(vm.updateText == "发现新版 abcdef123456" && !vm.isBusy && vm.canQuit, "只读检查完成后应显示结果且保留前台操作能力")
+                let arguments = try String(contentsOf: f.root.appendingPathComponent("update-arguments"), encoding: .utf8)
+                try expect(arguments.contains("--app\n\(f.root.appendingPathComponent("Demo Switcher.app").path)\n--core\n\(f.core.path)\n"), "更新器应以独立参数收到含空格的App路径和明确的假核心路径")
+            case "update_check_current":
+                try f.updateResponse("check", state: "current", message: "已经是最新版本")
+                let vm = f.vm()
+                try f.checkedUpdate(vm)
+                vm.installUpdate(confirmed: true)
+                try expect(!vm.updateAvailable && !vm.canInstallUpdate && f.updateCalls == ["check"], "无可用新版时不得执行更新")
+                try expect(vm.updateText == "已经是最新版本", "最新版本应显示组件确认的结果")
+            case "update_check_errors":
+                let vm = f.vm()
+                try f.checkedUpdate(vm)
+                try f.updateResponse("check", state: "error", message: "网络连接失败，请检查系统代理", exit: 1)
+                try f.checkedUpdate(vm)
+                try expect(!vm.updateAvailable && !vm.canInstallUpdate && vm.updateText == "网络连接失败，请检查系统代理", "检查失败应显示分类错误并清除旧的可更新状态")
+                for output in ["", "not-json", "{}", "{\"state\":\"available\",\"message\":\"\"}",
+                               "{\"state\":\"restarting\",\"message\":\"unexpected\"}"] {
+                    try f.write("update-check-output", output)
+                    try f.write("update-check-exit", "0")
+                    try f.checkedUpdate(vm)
+                    try expect(!vm.updateAvailable && !vm.canInstallUpdate && !vm.updateText.isEmpty, "缺失或未知检查结果不能允许安装")
+                }
+                try f.updateResponse("check", state: "available", message: "不能采信非零退出", exit: 7)
+                try f.checkedUpdate(vm)
+                try expect(!vm.updateAvailable && !vm.canInstallUpdate, "非零退出即使返回available也不得放行")
+                try expect(f.updateCalls.allSatisfy { $0 == "check" }, "检查失败不得隐式进入更新事务")
+            case "update_cancel":
+                let vm = f.vm()
+                vm.installUpdate(confirmed: false)
+                try f.checkedUpdate(vm)
+                vm.installUpdate(confirmed: false)
+                try expect(f.updateCalls == ["check"] && !vm.installingUpdate && !vm.isBusy && vm.canQuit, "取消或未确认不得下载准备、替换或限制退出")
+            case "update_check_serialized":
+                try f.write("update-check-delay", "0.2")
+                let vm = f.vm()
+                vm.checkUpdate(); vm.checkUpdate(); vm.installUpdate(confirmed: true)
+                try expect(vm.checkingUpdate && !vm.canInstallUpdate && !vm.installingUpdate, "检查中不得重复检查或启动安装")
+                try spin { !vm.checkingUpdate }
+                try expect(f.updateCalls == ["check"] && vm.updateAvailable, "重复点击只能完成一次检查")
+            case "update_success_restart":
+                let vm = f.vm()
+                var restarted = false
+                vm.onUpdateRestartReady = { restarted = true }
+                try f.checkedUpdate(vm)
+                vm.installUpdate(confirmed: true)
+                try expect(vm.installingUpdate && vm.isBusy && !vm.canQuit, "准备阶段必须立即锁定前台操作和退出")
+                try spin { restarted }
+                try expect(f.updateCalls == ["check", "prepare", "apply"], "必须先准备成功再交给独立更新事务")
+                try expect(vm.canQuit && vm.installingUpdate && vm.updateText == "准备重启切换器", "组件确认重启安排后才可退出旧App")
+                let arguments = try String(contentsOf: f.root.appendingPathComponent("update-arguments"), encoding: .utf8)
+                try expect(arguments.contains("apply\n--token\n\(updateToken)\n--pid\n\(ProcessInfo.processInfo.processIdentifier)\n"), "apply必须收到有效凭据和当前旧App PID")
+                try expect(f.calls.isEmpty, "桌面更新应使用独立组件，不能误触发旧核心的真实更新")
+            case "update_prepare_failures":
+                let vm = f.vm()
+                var restarted = false
+                vm.onUpdateRestartReady = { restarted = true }
+                try f.checkedUpdate(vm)
+                try f.updateResponse("prepare", state: "error", message: "SHA256校验失败，未应用更新", exit: 1)
+                vm.installUpdate(confirmed: true)
+                try spin { !vm.installingUpdate }
+                try expect(vm.updateText == "SHA256校验失败，未应用更新" && !vm.isBusy && vm.canQuit && vm.canInstallUpdate, "准备失败应显示原因并恢复可重试状态")
+                for token in [nil, "", "not-a-uuid"] as [String?] {
+                    try f.updateResponse("prepare", state: "prepared", message: "不完整的准备结果", token: token)
+                    vm.installUpdate(confirmed: true)
+                    try spin { !vm.installingUpdate }
+                    try expect(vm.updateText.contains("有效的更新凭据") && !vm.isBusy && vm.canQuit, "prepared必须带有效一次性凭据，否则不得替换")
+                }
+                try f.write("update-prepare-output", "not-json")
+                vm.installUpdate(confirmed: true)
+                try spin { !vm.installingUpdate }
+                try expect(!restarted && !f.updateCalls.contains("apply") && !vm.isBusy, "准备输出无效不能进入替换或触发退出")
+            case "update_apply_failure":
+                try f.updateResponse("apply", state: "error", message: "更新事务启动失败，安装版本未替换", exit: 1)
+                let vm = f.vm()
+                var restarted = false
+                vm.onUpdateRestartReady = { restarted = true }
+                try f.checkedUpdate(vm)
+                vm.installUpdate(confirmed: true)
+                try spin { !vm.installingUpdate }
+                try expect(f.updateCalls == ["check", "prepare", "apply"] && !restarted, "独立事务启动失败不得退出旧App")
+                try expect(!vm.isBusy && vm.canQuit && vm.canInstallUpdate && vm.updateText == "更新事务启动失败，安装版本未替换", "失败必须释放UI锁并保留准确错误")
+            case "update_prepare_current":
+                try f.updateResponse("prepare", state: "current", message: "重新核对后已是最新")
+                let vm = f.vm()
+                try f.checkedUpdate(vm)
+                vm.installUpdate(confirmed: true)
+                try spin { !vm.installingUpdate }
+                try expect(f.updateCalls == ["check", "prepare"] && !vm.updateAvailable && vm.canQuit && !vm.isBusy, "准备时已经最新应安全结束，不再安排重启")
+            case "update_operation_serialized":
+                try f.write("update-prepare-delay", "0.25")
+                try f.updateResponse("prepare", state: "error", message: "模拟取消事务", exit: 1)
+                let vm = f.vm()
+                try f.checkedUpdate(vm)
+                vm.installUpdate(confirmed: true)
+                vm.installUpdate(confirmed: true); vm.checkUpdate(); vm.refresh(); vm.fixAll(); vm.switchTo("B"); vm.inspectFingerprint()
+                try expect(vm.installingUpdate && !vm.canQuit && !vm.canInstallUpdate, "事务中必须禁止重复安装和前台操作")
+                try spin { !vm.installingUpdate }
+                try expect(f.updateCalls == ["check", "prepare"] && f.calls.isEmpty, "繁忙期间不得新增更新检查或核心修改任务")
+                try expect(vm.canQuit && !vm.isBusy, "事务失败后退出保护必须解除")
+            case "update_busy_guard":
+                let vm = f.vm()
+                try f.checkedUpdate(vm)
+                try f.write("fix-delay", "0.2")
+                vm.fixAll(); vm.checkUpdate(); vm.installUpdate(confirmed: true)
+                try f.idle(vm)
+                try expect(f.updateCalls == ["check"], "修复运行期间不能检查或安装新版本")
+                try f.write("check-config", #"{"disabled":[],"allowOptionalFailures":false,"logging":true}"#)
+                try f.write("get-config-delay", "0.2")
+                vm.loadCheckConfig(); vm.checkUpdate(); vm.installUpdate(confirmed: true)
+                try spin { !vm.settingsBusy }
+                try expect(f.updateCalls == ["check"], "检查设置事务期间不能开始更新")
+            case "update_guard_application":
+                let backend = GuardBackendFixture()
+                backend.writeDelay = 0.2
+                let settings = backend.model()
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm, guardSettings: settings)
+                settings.refresh(); try spin { !settings.isBusy }
+                try f.checkedUpdate(vm)
+                settings.selectedInterval = 5; settings.apply()
+                vm.checkUpdate(); vm.installUpdate(confirmed: true)
+                try expect(settings.isApplying && !vm.canInstallUpdate && !vm.installingUpdate, "管理员保镖事务期间不能启动桌面更新")
+                try spin { !settings.isBusy }
+                try expect(f.updateCalls == ["check"] && delegate.guardSettings === settings, "更新互斥应使用同一后台配置事务")
+                try expect(vm.canInstallUpdate, "管理员事务结束后应恢复更新能力")
+            case "update_monitor_late_sample":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try f.checkedUpdate(vm)
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=fail\n")
+                try f.write("monitor-delay", "0.4")
+                try f.write("update-prepare-delay", "0.12")
+                try f.updateResponse("prepare", state: "error", message: "模拟准备失败", exit: 1)
+                vm.pollEnvironment()
+                try spin { f.calls.contains("monitor-status") }
+                vm.installUpdate(confirmed: true)
+                try spin { !vm.installingUpdate }
+                try spin { !vm.monitorInFlight }
+                try expect(vm.phase == .ready && vm.rows.allSatisfy { $0.state == .ok }, "迟到的旧监测结果不能覆盖桌面更新事务")
+                try expect(vm.updateText == "模拟准备失败" && vm.canQuit, "采样不能覆盖更新失败结果或退出状态")
+            case "update_acknowledge":
+                let vm = f.vm()
+                vm.acknowledgeUpdate(token: "invalid")
+                try expect(f.updateCalls.isEmpty, "非法启动凭据不能调用更新组件")
+                vm.acknowledgeUpdate(token: updateToken)
+                try spin { vm.showUpdateSheet }
+                try expect(f.updateCalls == ["ack"] && vm.updateVersion == "abcdef123456" && vm.updateText == "已更新并确认启动", "新App应确认一次性更新事务并显示结果")
+                try expect(!vm.updateAvailable && !vm.installingUpdate, "启动握手不能自动开启下一轮更新")
+            case "update_missing_component":
+                let vm = VM(core: f.core.path, monitorInterval: nil, updateCommand: [])
+                vm.checkUpdate()
+                try expect(!vm.checkingUpdate && !vm.updateAvailable && !vm.canInstallUpdate && !vm.updateText.isEmpty, "缺少更新组件时应说明异常，不能调用真实核心作为后备更新")
+                try expect(f.calls.isEmpty && f.updateCalls.isEmpty, "更新组件缺失必须安全退出")
             case "monitor_healthy":
                 let vm = f.vm()
                 vm.start(); try f.idle(vm)

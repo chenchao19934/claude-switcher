@@ -4,6 +4,10 @@
 cd "$(dirname "$0")/.." || exit 1
 shasum -a 256 \
     core/claude-switch.sh \
+    core/stun-probe.py \
+    core/desktop-update.py \
+    app/main.swift \
+    assets/icon-2048.png \
     daemons/claude-bodyguard.sh \
     daemons/bodyguard-settings.py \
     daemons/tz-watchdog.sh \

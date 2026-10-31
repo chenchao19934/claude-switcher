@@ -40,6 +40,7 @@ rm -rf "$APP" "$ZIP" "$DMG" "$KIT_ZIP"
 
 echo "==> 编译 $APP_NAME $VERSION ($ARCH_LABEL)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$ROOT/core/desktop-update.py" "$APP/Contents/Resources/desktop-update.py"
 swiftc -O -parse-as-library -warnings-as-errors \
     -target "$ARCH-apple-macos13.0" \
     "$ROOT/app/main.swift" \
@@ -58,6 +59,8 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 echo "==> 写入 Info.plist"
+APP_SOURCE_SHA=$(shasum -a 256 "$ROOT/app/main.swift" | awk '{print $1}')
+APP_ICON_SHA=$(shasum -a 256 "$ROOT/assets/icon-2048.png" | awk '{print $1}')
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -74,6 +77,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>LSUIElement</key><true/>
+	<key>ClaudeSwitcherAppSourceSHA256</key><string>$APP_SOURCE_SHA</string>
+	<key>ClaudeSwitcherIconSourceSHA256</key><string>$APP_ICON_SHA</string>
 	<key>CFBundleURLTypes</key><array><dict>
 		<key>CFBundleURLName</key><string>local.claude-switcher</string>
 		<key>CFBundleURLSchemes</key><array><string>claude-switcher</string></array>
@@ -86,7 +91,8 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 if codesign --force --deep -s - "$APP" >/dev/null 2>&1; then
     echo "✓ ad-hoc 签名完成"
 else
-    echo "⚠️ ad-hoc 签名失败，继续打包"
+    echo "✗ ad-hoc 签名失败，已停止打包" >&2
+    exit 1
 fi
 
 # 提供真实签名身份时，将原生 Widget 一并嵌入，再生成 ZIP / DMG。
@@ -138,15 +144,15 @@ mkdir -p "$KIT_ROOT/assets" "$KIT_ROOT/docs"
 mkdir -p "$KIT_ROOT/docs/images"
 mkdir -p "$KIT_ROOT/scripts"
 cp "$ROOT/scripts/build-macos-widget.sh" "$ROOT/scripts/package-macos.sh" "$KIT_ROOT/scripts/"
-cp "$ROOT/docs/MACOS-WIDGET.md" "$KIT_ROOT/docs/"
+cp "$ROOT/docs/MACOS-WIDGET.md" "$ROOT/docs/MACOS-UPDATES.md" "$KIT_ROOT/docs/"
 cp "$ROOT/assets/icon-2048.png" "$KIT_ROOT/assets/"
 cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
 cp "$ROOT/docs/images/macos-background-polling.png" "$KIT_ROOT/docs/images/"
 chmod +x "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command"
 for ITEM in \
     README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS \
-    core/claude-switch.sh daemons/claude-bodyguard.sh daemons/bodyguard-settings.py installer/安装.command \
-    app/main.swift assets/icon-2048.png docs/screenshot.png docs/images/macos-background-polling.png; do
+    core/claude-switch.sh core/stun-probe.py core/desktop-update.py daemons/claude-bodyguard.sh daemons/bodyguard-settings.py installer/安装.command \
+    app/main.swift assets/icon-2048.png docs/MACOS-UPDATES.md docs/screenshot.png docs/images/macos-background-polling.png; do
     if [ ! -e "$KIT_ROOT/$ITEM" ]; then
         echo "✗ installer kit 缺少 $ITEM" >&2
         exit 1

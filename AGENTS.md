@@ -23,7 +23,7 @@
 
 首选引导用户运行安装器（双击 `installer/安装.command`，或终端执行它）。如果安装器环境受限，按下面的手动等效步骤执行：
 
-1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch.sh`（可执行），把 `core/stun-probe.py` 放到 `~/.claude-switcher/`
+1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch.sh`（可执行），把 `core/stun-probe.py` 与 `core/desktop-update.py` 放到 `~/.claude-switcher/`
 2. 探测代理客户端并写进脚本顶部 `PROXY_MODE="..."`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/shadowrocket/sing-box/clashx/surge/auto 中选择
 3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名写进 `PROXY_GROUP="..."`（其他客户端跳过）
 4. 按出口 IP 自动锁定地区目标：多源依次尝试 ipinfo.io（country/timezone）→ ipapi.co（country_code/timezone）→ ifconfig.co（country_iso/timezone）→ Cloudflare trace（loc，时区用国家默认映射），全失败时让用户在 US/JP/TW/HK/SG/GB/DE/FR/KR/AU/CA 中手动选，`FORCE=1` 按 US + America/New_York；country → `COUNTRY_TARGET`，timezone → `TZ_TARGET`，country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ `LOCALE_TARGET`，三项都写进脚本头部
@@ -32,12 +32,15 @@
    ```bash
    swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o Claude切换器.app/Contents/MacOS/ClaudeSwitcher -framework SwiftUI -framework AppKit
    ```
-   图标用 `assets/icon-2048.png` 经 sips 生成 iconset 再 `iconutil -c icns` 打进 `Contents/Resources/AppIcon.icns`，`Info.plist` 声明 `CFBundleIconFile`，最后 `codesign --force --deep -s -`
+   将 `core/desktop-update.py` 复制到 App 的 `Contents/Resources/desktop-update.py`。图标用 `assets/icon-2048.png` 经 sips 生成 iconset 再 `iconutil -c icns` 打进 `Contents/Resources/AppIcon.icns`，`Info.plist` 声明 `CFBundleIconFile`，最后 `codesign --force --deep -s -`
 7. Clash Verge 模式下通过核心脚本的 `write-merge-rules` 隐藏入口生成「全局扩展脚本」(profiles/Script.js)，直接前置 `config.rules`，保留已有 main，备份并迁移 Merge.yaml 中本项目旧标记块；重启 Clash Verge 后必须验证内核 `/rules`。其他客户端提示用户自行添加 DOMAIN-SUFFIX 置顶规则
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
 日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行比对去重 → 备份 .bak → 注入配置 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
+
+
+macOS 界面更新：新版「版本更新」页使用 App 内置的 `core/desktop-update.py`（安装／打包时复制到 `Contents/Resources/desktop-update.py`），先只读检查，再由用户确认准备、完整审计、备份替换 App／核心／STUN 和重启握手；失败回滚全部。更新源固定为当前维护仓库 `chenchao19934/claude-switcher` 的 main，源码与清单固定到同一提交，下载沿用环境代理或 macOS 系统代理。终端 `update` 仍不换 GUI，但会同步核心、STUN 与用户态桌面更新组件；任何缺行、硬项非 ok、非零退出都会回滚。两条更新路径共用 `~/.claude-switcher/.update.lock`，不清未知锁；拒绝 root 实际更新，不部署系统守护。旧 GUI 需先替换一次；正式签名／Widget 版本不可用源码 ad-hoc 更新降级。详见 `docs/MACOS-UPDATES.md`。
 
 检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 6 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
