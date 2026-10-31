@@ -67,7 +67,7 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 ### 3. Fail-Closed Kill-Switch
 
-常驻守护进程以 10s 周期巡检隧道健康度（内核进程 × 虚拟网卡双因子），隧道中断即刻终止受保护进程。区别于客户端自带的 Fail-Open 容错重试——那种机制会把含真实 IP 的握手包送到对方网关日志里，哪怕最终"超时失败"。
+常驻守护进程默认以 10s 目标周期巡检隧道健康度（内核进程 × 虚拟网卡双因子），发现异常后请求终止受保护进程。可在面板中将周期收紧到 2–10 秒；睡眠、任务耗时与系统调度会影响实际触发，并非硬实时保证。区别于客户端自带的 Fail-Open 容错重试——那种机制会把含真实 IP 的握手包送到对方网关日志里，哪怕最终"超时失败"。
 
 ### 4. Session Snapshot 快照隔离
 
@@ -94,13 +94,17 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 ## 界面
 
-![Screenshot](docs/screenshot.png)
+macOS 版采用快捷启动面板：点击菜单栏状态，或按默认 `⌃⌥Space`（Control + Option + 空格）即可呼出。账号和常用操作横向排列，检查详情与设置在面板内切页，闲时点击其他应用即可收起。
 
-原生 SwiftUI 单文件应用（无 Xcode 工程、无第三方依赖，`swiftc` 一条命令出可执行文件），图标由 Swift 代码程序生成——整个仓库不含一张设计素材。
+![macOS 快捷面板：搜索、账号与常用操作](docs/screenshot.png)
+
+> 截图来自原生 App 的隔离演示，检查结果、账号与状态均为假数据，仅展示交互样式，不代表真实环境已通过审计。
+
+界面使用原生 SwiftUI / AppKit，无第三方界面依赖；源码可直接用 `swiftc` 构建。菜单栏持续展示当前账号和最近检查结果，核心 14 项检查与切换前重新审计保持原有规则。
 
 ## 安装
 
-**系统要求**：macOS · Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
+**系统要求**：macOS 13+ · Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
 
 > **Windows 用户**：[`windows/`](windows/) 目录提供 Windows 版（PowerShell + WPF，Beta），安装与注意事项见 [windows/README.md](windows/README.md)。
 > **Linux 用户**：[`linux/`](linux/) 目录提供 Linux 版（bash + systemd，Beta），设计取舍（无官方桌面版→切换浏览器登录态）见 [linux/README.md](linux/README.md)。
@@ -140,11 +144,11 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 ## 使用
 
-1. 双击桌面「Claude切换器」→ 等待 14 项检查
-2. 硬性安全项全部通过 → 选账号启动；有红项 → 「一键修复」自动处理。灰色跳过项仅代表用户明确关闭了对应非关键检查
-3. B/C/D 账号首次使用登录一次，以后 A–D 随切随用、互不干扰
+1. 首次双击桌面「Claude切换器」，等待启动时的 14 项检查；以后点击菜单栏状态或按 `⌃⌥Space` 随时呼出面板。
+2. 在横向 A–D 卡片中选择账号。每次启动／切换前都会重新审计，硬性安全项全部通过才继续；有红项时先打开「查看 14 项检查」，处理问题或使用「一键修复」。灰色跳过项不计入通过数量。
+3. 搜索框可快速查找账号、检查项和操作。常用入口为「重新检查」「一键修复」「检查设置」「设备体检」「代理客户端」「检查更新」，「AI 配置」位于面板底部。B/C/D 首次使用各登录一次，以后按槽位切换。
 4. 换了其他国家的节点 → 跑一次 `~/.local/bin/claude-switch.sh set-region`，国家/时区/地区格式一键重新锁定
-5. 换了代理客户端 → 在界面「代理客户端」下拉菜单选中即可切换（或 `set-client` 命令），切换后自动重新审计
+5. 换了代理客户端 → 打开面板「代理客户端」选择对应客户端（或运行 `set-client`），切换后自动重新审计；已安装的 root 保镖还需按下文说明重新运行安装器同步模式。
 
 ### 检查设置与诊断日志
 
@@ -157,7 +161,7 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 ~/.local/bin/claude-switch.sh set-check-config '{"disabled":["DNS"],"allowOptionalFailures":false,"logging":true}'
 ```
 
-脱敏客户端日志默认开启，位于 `~/Library/Logs/claude-switcher/client.log`，达到 512 KiB 后轮转为 `client.log.1`。日志只记录命令、退出码、耗时和检查状态，不记录公网/住宅/代理 IP、Bearer/token/session/cookie、账号内容或 Clash 配置。点击设置里的「导出诊断日志」，或运行 `~/.local/bin/claude-switch.sh export-diagnostics <文件路径>`，可生成只含日志、检查设置和脱敏环境/状态摘要的 zip；不包含账号快照、`lastip`、`iphistory` 或原始 `last-check.txt`。
+脱敏客户端日志默认开启，位于 `~/Library/Logs/claude-switcher/client.log`，达到 512 KiB 后轮转为 `client.log.1`。日志只记录命令、退出码、耗时和检查状态，不记录公网/住宅/代理 IP、Bearer/token/session/cookie、账号内容或 Clash 配置。点击检查设置里的「导出诊断…」，或运行 `~/.local/bin/claude-switch.sh export-diagnostics <文件路径>`，可生成只含日志、检查设置和脱敏环境/状态摘要的 zip；不包含账号快照、`lastip`、`iphistory` 或原始 `last-check.txt`。
 
 ### macOS 快捷呼出与菜单栏状态
 
@@ -169,9 +173,25 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 - 检查、修复、切换和指纹体检期间不会重复执行操作；修复或账号切换期间暂时不能退出。操作结束后可从菜单明确退出。
 - 退出切换器不会卸载或停止独立的保镖、时区看门狗和自动更新服务。应用本身不会因此新增登录自启动。
 
-已安装的旧版 GUI 需要重新编译（或重新运行安装器）才会获得菜单栏功能；现有 `update` 命令仅更新核心脚本，不会替换 GUI。
+已安装的旧版 GUI 需要替换为本版 App、重新编译或重新运行安装器，才会获得快捷面板和自定义快捷键；现有 `update` 命令仅更新核心脚本，不会替换 GUI。
 
-通知中心另提供原生小号／中号「Claude 状态」小组件，只展示最近检查的脱敏摘要，点击呼出面板。需要带真实团队签名和 App Group 的构建；默认 ad-hoc App 包不包含可注册的小组件，构建与验收见 [macOS 小组件指南](docs/MACOS-WIDGET.md)。代理异常时的进程处理、登录态与快照边界见 [代理异常处理说明](docs/PROXY-FAILURE-BEHAVIOR.md)。
+### 后台保镖巡检周期
+
+在「检查设置 → 后台保镖巡检」选择 **2–10 秒**的目标周期，默认 **10 秒**，然后点击「授权并应用」。此操作需要管理员授权；系统组件写入、重载服务并核对后，才显示实际已确认周期。取消授权保留原设置，无法确认时显示「未确认」，不会把选中的数字当作已生效；应用失败会尝试恢复旧配置。
+
+![检查设置中的后台保镖巡检卡片（隔离演示）](docs/images/macos-background-polling.png)
+
+> 图中为隔离演示的模拟周期；演示不会修改真实后台服务，也不会弹出管理员授权。
+
+该设置仅调整代理内核／TUN 的后台巡检，不增加完整 14 项检查的定时轮询，也不改变检测与终止条件。退出切换器后保镖继续独立运行。界面不提供关闭或延长周期的选项；睡眠、任务耗时和系统调度仍会影响实际触发时间。
+
+旧安装若缺少 root 所有的系统配置组件，需要重新运行最新版 `installer/安装.command`；普通核心 `update` 不会部署它。界面会显示缺失／权限异常提示，不会改为提权运行仓库或用户目录副本。代理异常时的进程处理、登录态与快照边界见 [代理异常处理说明](docs/PROXY-FAILURE-BEHAVIOR.md)。
+
+### 通知中心状态小组件
+
+仓库提供小号／中号「Claude 状态」原生小组件，可展示当前账号与最近检查的脱敏摘要，点击呼出快捷面板。它展示的是**最近检查，非实时监控**；过期结果会明确提示。
+
+通知中心注册需要带真实团队签名、正确 App Group 的构建，并安装、启动包含扩展的主 App。**默认 ad-hoc App 包不包含可注册的小组件**；仅编译扩展也不代表系统小组件已可用。构建方式、签名条件与待验收范围见 [macOS 小组件指南](docs/MACOS-WIDGET.md)。
 
 开发者可在 macOS 上运行 `python3 -m unittest discover -s tests -v`，其中菜单栏模型测试使用假核心脚本，不访问真实账号或网络。隔离 UI 验证方法见 [tests/MENU-BAR-TESTING.md](tests/MENU-BAR-TESTING.md)。
 
@@ -183,9 +203,9 @@ Mac 开发环境、隔离界面启动与应用打包见 [macOS 开发指南](doc
 
 - **创建**：在账号卡片里点击「账号 C」或「账号 D」的空槽位即可。首次使用会在 Claude 里看到登录页，登录一次后该槽位自动成为该账号的独立身份。
 - **卡片含义**：
-  - `当前`：切换器正在使用的账号
-  - `已建档 · 1.2G · 10-20`：该槽位已有独立快照，附带快照体积与最后归档日期
-  - `未初始化`：空槽位，点击后创建新身份
+  - `当前使用`：切换器正在使用的账号
+  - `已建档 · 1.2G`：该槽位已有独立快照，显示快照体积
+  - `首次登录`：空槽位，审计通过后点击创建新身份并登录
 - **快照位置**：`~/.claude-switcher/accounts/<A|B|C|D>/`。切换时当前账号会先归档到对应目录，再把目标账号还原到 `~/Library/Application Support/Claude`；四个目录彼此独立，互不覆盖。
 - **CLI**：`~/.local/bin/claude-switch.sh switch A|B|C|D`。账号参数只接受 A–D，其他值会输出 `FAIL:` 并拒绝切换。
 - **状态**：`claude-switch.sh status` 在原有 `current/hasA/hasB` 字段外新增 `hasC/hasD`、`accounts=A,B,C`（无归档时为 `none`）与 `accA=<大小>@<日期>`；旧版界面仍可读取前两组字段。
@@ -241,7 +261,7 @@ Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SH
 
 ## 设备指纹体检（macOS CLI / App 内置）
 
-14 项审计之外，提供一层按需的深挖体检，点 App 右上角心电图标或运行：
+14 项审计之外，提供一层按需的深挖体检，在快捷面板点击「设备体检」或运行：
 
 ```bash
 ~/.local/bin/claude-switch.sh fingerprint
@@ -290,7 +310,7 @@ Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SH
 
 ## 更换代理客户端（macOS）
 
-安装时选错了客户端、或后来从 Clash Verge 换到 FlClash / Shadowrocket 等，可以直接在 App 界面的「代理客户端」下拉菜单里切换（选中即生效并自动重新审计）；也可以先改核心配置。**如果已安装 root 保镖，切换后还必须重新运行安装器同步其模式**（不会由用户态命令直接改写 root 文件）：
+安装时选错了客户端、或后来从 Clash Verge 换到 FlClash / Shadowrocket 等，可以打开快捷面板的「代理客户端」内页，选择对应客户端并自动重新审计；也可以使用 CLI。**如果已安装 root 保镖，切换后还必须重新运行安装器同步其模式**（不会由用户态命令直接改写 root 文件）：
 
 ```bash
 ~/.local/bin/claude-switch.sh set-client flclash
@@ -394,23 +414,29 @@ WEBRTC_POLICY=proxy ~/.local/bin/claude-switch.sh fix
 ## 项目结构
 
 ```
-├── app/main.swift          # SwiftUI 界面(单文件)
+├── app/
+│   ├── main.swift          # SwiftUI 快捷面板、菜单栏与自定义快捷键
+│   └── StatusWidget.swift  # WidgetKit 状态小组件（需团队签名）
 ├── core/
 │   ├── claude-switch.sh    # 核心逻辑:审计/切换/修复
 │   └── stun-probe.py       # STUN 探针(手工协议实现)
 ├── windows/                # Windows 版(PowerShell 核心 + WPF 界面, Beta)
 ├── linux/                  # Linux 版(bash 核心 + systemd 保镖 + 终端菜单, Beta)
 ├── docs/                   # Web 版环境检测页(index.html 等, GitHub Pages 从这里发布) + 项目文档
-├── daemons/                # Kill-Switch / Watchdog / 自动更新 launchd 模板
+├── daemons/                # Kill-Switch / Watchdog / 自动更新模板与 root 周期配置组件
 ├── installer/              # 双击安装/卸载
-├── scripts/gen-sums.sh     # 重新生成 SHA256SUMS(改动 core/daemons/installer 后必跑)
+├── scripts/
+│   ├── dev-macos.sh        # 隔离演示、测试与开发环境检查
+│   ├── package-macos.sh    # App / ZIP / DMG / 安装包构建
+│   ├── build-macos-widget.sh # 小组件编译、签名与嵌入
+│   └── gen-sums.sh         # 重新生成 SHA256SUMS(改动 core/daemons/installer 后必跑)
 ├── SHA256SUMS              # 发布工件完整性校验清单(自动更新逐项比对)
 └── assets/                 # 程序生成图标
 ```
 
 ## 二改指南
 
-- **改界面**：编辑 `app/main.swift`，`swiftc -O -parse-as-library` 重编译即可
+- **改界面**：编辑 `app/main.swift`，运行 `bash scripts/dev-macos.sh run` 用假数据预览；`bash scripts/dev-macos.sh package 0.0.0-dev` 构建分发包，详见 [Mac 开发指南](docs/MACOS-DEVELOPMENT.md)
 - **加检查项**：`core/claude-switch.sh` 的 `checkdetail()` + UI 的 `keyMap` 各加一行
 - **改防护策略**：`daemons/` 里的模板即全部守护逻辑
 
@@ -432,20 +458,22 @@ Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 - 在 [Linux.do](https://linux.do) 论坛发帖讨论
 - **安全问题请走非公开渠道**：见 [SECURITY.md](SECURITY.md)（GitHub Private Vulnerability Reporting 优先）
 
-反馈掉登录、弹盾类问题时，请附上「应用设置 → 日志」导出的日志，里面不含密码和 Cookie 原文；如果可以，也请附上可复现步骤。
+反馈掉登录、弹盾类问题时，请附上「检查设置 → 导出诊断…」生成的诊断包，里面不含账号、IP 或凭据；也请附上可复现步骤。
 
 ## 路线图
 
 本项目按"实战驱动"迭代——风控怎么进化，防护就怎么跟上：
 
 - [x] macOS 版：14 项环境审计 + Kill-Switch + 快照切换 + 漂移自愈（已稳定）
+- [x] macOS 快捷面板：菜单栏状态、自定义全局快捷键、搜索和 A–D 横向账号卡片；可授权调整后台保镖巡检周期
+- [ ] macOS 通知中心小组件：源码与构建入口已提供，需真实团队签名／App Group 环境完成系统注册验收
 - [x] Windows 版（Beta）：核心逻辑全移植
 - [x] Linux 版（Beta）：bash 核心 + systemd 保镖 + 终端菜单
 - [ ] Windows 版稳定化：A–D、诊断工具、加密快照与 WPF 功能对齐已落地（静态验证通过），真机回归持续进行
 - [ ] Linux 版稳定化：多客户端/地区自适应/COW 快照已落地（桩测试通过），多发行版真机回归持续进行
 - [x] Web 版环境检测页：手机/平板浏览器打开即测，零安装
 - [x] 更多指纹维度：桌面端 `fingerprint` 命令覆盖字体地区特征 + GPU/虚拟机特征，Canvas/WebGL 由 Web 检测页覆盖
-- [x] 更多代理客户端适配：已支持 Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge（含 auto 自动识别），并可在 App 内下拉一键切换
+- [x] 更多代理客户端适配：已支持 Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge（含 auto 自动识别），并可在 App「代理客户端」内页切换
 - [x] 快照切换提速：归档改为同卷移动 + 载入走 COW 克隆（APFS clonefile / Linux reflink），不再产生全量复制
 - [x] 应用内自动更新：launchd 每 12 小时自动检查更新，自检失败自动回滚，也可手动 `claude-switch.sh update` 保底
 

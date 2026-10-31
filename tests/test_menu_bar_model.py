@@ -20,6 +20,10 @@ SCENARIOS = (
     "panel_settings_recording_guard", "panel_child_sheet_guard", "panel_busy_close",
     "panel_url_open_only", "shortcut_preferences", "shortcut_invalid_rejected",
     "shortcut_press_gate", "panel_shortcut_protection", "panel_shortcut_busy_toggle",
+    "bodyguard_status_validation", "bodyguard_invalid_interval", "bodyguard_apply_success",
+    "bodyguard_cancel_preserves", "bodyguard_apply_unconfirmed", "bodyguard_operation_serialization",
+    "bodyguard_vm_busy_denies", "bodyguard_apply_lifecycle",
+    "bodyguard_search_operation_guard",
     "snapshot_status_semantics", "snapshot_privacy",
 )
 

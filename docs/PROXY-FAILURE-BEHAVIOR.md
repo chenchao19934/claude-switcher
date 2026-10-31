@@ -10,13 +10,21 @@
 
 ## Claude 已经在运行
 
-安装并注册的 root LaunchDaemon `local.claude-bodyguard` 以 `StartInterval=10` 调度保镖，检查对应代理客户端进程与 `198.18.*` TUN 地址。发现代理内核退出或 TUN 消失时，执行：
+安装并注册的 root LaunchDaemon `local.claude-bodyguard` 默认以 `StartInterval=10`、`ThrottleInterval=10` 调度保镖，检查对应代理客户端进程与 `198.18.*` TUN 地址。发现代理内核退出或 TUN 消失时，执行：
 
 ```bash
 pkill -f '/Applications/Claude.app/Contents/MacOS/Claude'
 ```
 
 这是默认 SIGTERM 终止请求，不是强制 `SIGKILL`，脚本也没有等待并确认最终退出。10 秒是调度配置，不是异常后必定在 10 秒内完成的承诺。它直接匹配 Claude 桌面主进程，不直接覆盖浏览器、Claude Code CLI 或所有 Helper。
+
+## 自定义后台巡检周期
+
+在「检查设置 → 后台保镖巡检」选择 2–10 秒的整数，默认 10 秒，点击「授权并应用」。面板先读取固定系统配置，再经管理员授权调用 root 所有的 `bodyguard-settings.py`，同时更新两个周期键、重载并核对运行配置；重载或验证失败会尝试恢复原配置。取消授权保留原设置，无法确认时显示「未确认」，不会把选中的数字当成已生效。
+
+`ThrottleInterval` 必须一起修改，否则 launchd 默认节流会使 2／5 秒配置仍可能按约 10 秒启动。目标周期不是硬实时：睡眠期间、上次任务仍在运行时可能错过调度。更短周期仅减少正常唤醒状态下的检查间隔，不改变进程级防护边界。当前不允许关闭或延长至 10 秒以上。
+
+此配置不增加面板定时跑完整 14 项检查；保镖仍独立于 App。旧安装缺少 root 配置组件时需重新运行安装器，普通核心 `update` 不会部署它。重新安装会保留可信配置中已有的 2–10 秒周期。配置备份位于系统托管目录的 `bodyguard.plist.backup`，由管理员恢复或重新安装时核对，不包含账号数据。
 
 ## 账号、登录态和快照
 

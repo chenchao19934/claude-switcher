@@ -9,7 +9,8 @@ final class FixtureDelegate: AppDelegate {
             fatalError("隔离演示需要显式传入 fake-core.sh 路径")
         }
         super.init(vm: VM(core: CommandLine.arguments[1]),
-                   enableSystemIntegration: CommandLine.arguments.contains("--hotkey"))
+                   enableSystemIntegration: CommandLine.arguments.contains("--hotkey"),
+                   guardSettings: .demo(core: CommandLine.arguments[1]))
     }
 
     override func applicationDidFinishLaunching(_ notification: Notification) {
@@ -63,7 +64,8 @@ struct MenuBarFixture: App {
             .commands {
                 // 隔离演示的辅助操作入口；原生菜单栏右键菜单另由 AppDelegate 管理。
                 CommandMenu("菜单内容预览") {
-                    MenuBarContent(vm: appDelegate.vm, showWindow: appDelegate.showMainWindow)
+                    MenuBarContent(vm: appDelegate.vm, showWindow: appDelegate.showMainWindow,
+                                   canOperate: { !appDelegate.guardSettings.isApplying })
                 }
                 CommandMenu("演示外观") {
                     Button("浅色") { NSApplication.shared.appearance = NSAppearance(named: .aqua) }

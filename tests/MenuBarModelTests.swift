@@ -24,6 +24,45 @@ private func pump(_ seconds: TimeInterval) {
     RunLoop.current.run(until: Date().addingTimeInterval(seconds))
 }
 
+private func guardStatusJSON(_ interval: Int = 10, throttle: Int? = nil,
+                             registered: Bool = true, active: Int? = nil,
+                             unknownRuntime: Bool = false) -> String {
+    let runtime = unknownRuntime ? "null" : String(active ?? interval)
+    return "{\"interval\":\(interval),\"throttleInterval\":\(throttle ?? interval),\"registered\":\(registered),\"activeInterval\":\(runtime)}"
+}
+
+private final class GuardBackendFixture {
+    var readResult = BodyguardCommandResult(output: guardStatusJSON(), succeeded: true)
+    var writeResult: BodyguardCommandResult?
+    var readDelay: TimeInterval = 0
+    var writeDelay: TimeInterval = 0
+    private let lock = NSLock()
+    private var readCounter = 0
+    private var requestedIntervals: [Int] = []
+
+    var reads: Int {
+        lock.lock(); defer { lock.unlock() }
+        return readCounter
+    }
+
+    var writes: [Int] {
+        lock.lock(); defer { lock.unlock() }
+        return requestedIntervals
+    }
+
+    func model() -> BodyguardSettings {
+        BodyguardSettings(readStatus: { [self] in
+            lock.lock(); readCounter += 1; lock.unlock()
+            Thread.sleep(forTimeInterval: readDelay)
+            return readResult
+        }, writeInterval: { [self] interval in
+            lock.lock(); requestedIntervals.append(interval); lock.unlock()
+            Thread.sleep(forTimeInterval: writeDelay)
+            return writeResult ?? BodyguardCommandResult(output: guardStatusJSON(interval), succeeded: true)
+        })
+    }
+}
+
 private final class Fixture {
     let root: URL
     let core: URL
@@ -528,6 +567,169 @@ struct MenuBarModelTests {
                 try f.idle(vm)
                 try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "手动快捷键收起与重开不能重复或中断修复")
                 delegate.hidePanel()
+            case "bodyguard_status_validation":
+                try expect(BodyguardIntervalStatus.decode(guardStatusJSON())?.verifiedInterval == 10, "一致且已注册的调度才可显示已生效")
+                for json in [guardStatusJSON(5, throttle: 10), guardStatusJSON(5, active: 10), guardStatusJSON(5, registered: false), guardStatusJSON(5, unknownRuntime: true)] {
+                    guard let status = BodyguardIntervalStatus.decode(json) else { throw TestFailure(description: "合法但未确认的状态应可展示原因") }
+                    try expect(status.verifiedInterval == nil, "未知、未注册或不一致的运行状态不得冒充已生效")
+                }
+                for json in ["not-json", "{}", guardStatusJSON(0), guardStatusJSON(1), guardStatusJSON(11), guardStatusJSON(5, throttle: 0), guardStatusJSON(5, active: 11), String(repeating: " ", count: 4097) + guardStatusJSON()] {
+                    try expect(BodyguardIntervalStatus.decode(json) == nil, "无效或过大后台响应必须拒绝")
+                }
+            case "bodyguard_invalid_interval":
+                let backend = GuardBackendFixture()
+                let settings = backend.model()
+                settings.refresh()
+                try spin { !settings.isBusy }
+                for interval in [Int.min, -1, 0, 1, 11, Int.max] {
+                    settings.selectedInterval = interval
+                    try expect(!settings.canApply, "越界整数不能成为可应用配置")
+                    settings.apply()
+                    try expect(!settings.isBusy && !settings.isApplying && settings.current?.verifiedInterval == 10, "拒绝非法值不得改变已核对周期")
+                }
+                try expect(backend.writes.isEmpty, "非法输入不得进入管理员写入后端")
+                settings.selectedInterval = 2
+                try expect(settings.canApply, "最短支持周期应可选择")
+                settings.selectedInterval = 10
+                try expect(!settings.canApply, "当前已核对周期无需重复应用")
+            case "bodyguard_apply_success":
+                let backend = GuardBackendFixture()
+                backend.writeDelay = 0.1
+                let settings = backend.model()
+                settings.refresh()
+                try spin { !settings.isBusy }
+                settings.selectedInterval = 2
+                settings.apply()
+                try expect(settings.isBusy && settings.isApplying, "应用请求必须立即进入互斥状态")
+                settings.selectedInterval = 9
+                try spin { !settings.isBusy }
+                try expect(settings.current?.verifiedInterval == 2 && settings.selectedInterval == 2, "只有与已发请求匹配的已核对响应才能提交结果")
+                try expect(backend.writes == [2] && !settings.canApply, "成功应用不能继续派发相同配置")
+                settings.apply()
+                try expect(backend.writes == [2], "同周期应用应保持幂等")
+                settings.selectedInterval = 10
+                settings.apply()
+                try spin { !settings.isBusy }
+                try expect(settings.current?.verifiedInterval == 10 && backend.writes == [2, 10], "默认周期边界也应可恢复")
+            case "bodyguard_cancel_preserves":
+                let backend = GuardBackendFixture()
+                backend.writeResult = BodyguardCommandResult(output: "", succeeded: false, cancelled: true)
+                let settings = backend.model()
+                settings.refresh()
+                try spin { !settings.isBusy }
+                settings.selectedInterval = 5
+                settings.apply()
+                try spin { !settings.isBusy }
+                try expect(settings.current?.verifiedInterval == 10 && !settings.isApplying, "取消管理员授权必须保留已知旧周期并解除互斥")
+                try expect(settings.message.contains("取消") && !settings.message.contains("已核对后台调度为 5"), "取消不得展示为应用成功")
+                try expect(settings.canApply && backend.writes == [5], "取消后应允许用户主动重试")
+            case "bodyguard_apply_unconfirmed":
+                let responses = [
+                    BodyguardCommandResult(output: guardStatusJSON(5), succeeded: false),
+                    BodyguardCommandResult(output: "not-json", succeeded: true),
+                    BodyguardCommandResult(output: guardStatusJSON(7), succeeded: true),
+                    BodyguardCommandResult(output: guardStatusJSON(5, unknownRuntime: true), succeeded: true),
+                    BodyguardCommandResult(output: guardStatusJSON(5, registered: false), succeeded: true),
+                    BodyguardCommandResult(output: guardStatusJSON(5, throttle: 10), succeeded: true),
+                ]
+                for response in responses {
+                    let backend = GuardBackendFixture()
+                    backend.writeResult = response
+                    let settings = backend.model()
+                    settings.refresh()
+                    try spin { !settings.isBusy }
+                    settings.selectedInterval = 5
+                    settings.apply()
+                    try spin { !settings.isBusy }
+                    try expect(settings.current == nil && !settings.canApply && !settings.isApplying, "失败或不匹配响应必须清除未确认状态，不沿用旧绿灯")
+                    try expect(settings.message.contains("未确认") && backend.writes == [5], "失败应要求重新读取，不能自动重复写入")
+                }
+            case "bodyguard_operation_serialization":
+                let backend = GuardBackendFixture()
+                backend.readDelay = 0.15
+                backend.writeDelay = 0.15
+                let settings = backend.model()
+                settings.refresh()
+                settings.refresh()
+                settings.selectedInterval = 5
+                settings.apply()
+                try spin { !settings.isBusy }
+                try expect(backend.reads == 1 && backend.writes.isEmpty, "读取中应忽略重复读取和应用")
+                settings.selectedInterval = 5
+                settings.apply()
+                settings.apply()
+                settings.refresh()
+                try spin { !settings.isBusy }
+                try expect(backend.reads == 1 && backend.writes == [5], "应用中不得并发读取或重复写入")
+                try expect(settings.current?.verifiedInterval == 5, "重复操作不能覆盖已提交的后台响应")
+            case "bodyguard_vm_busy_denies":
+                try f.write("check-delay", "0.2")
+                try f.write("check-config", #"{"disabled":[],"allowOptionalFailures":false,"logging":true}"#)
+                try f.write("get-config-delay", "0.2")
+                let backend = GuardBackendFixture()
+                let settings = backend.model()
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm, guardSettings: settings)
+                settings.refresh()
+                try spin { !settings.isBusy }
+                settings.selectedInterval = 5
+                vm.refresh()
+                settings.apply()
+                try expect(vm.isBusy && !settings.isApplying && backend.writes.isEmpty, "审计运行时不得启动管理员应用")
+                try f.idle(vm)
+                vm.loadCheckConfig()
+                settings.apply()
+                try expect(vm.settingsBusy && !settings.isApplying && backend.writes.isEmpty, "检查设置读取时也不得启动管理员应用")
+                try spin { !vm.settingsBusy }
+                settings.apply()
+                try spin { !settings.isBusy }
+                try expect(backend.writes == [5] && settings.current?.verifiedInterval == 5, "VM空闲后应恢复应用能力")
+                try expect(delegate.guardSettings === settings, "互斥必须使用控制器注入的同一配置模型")
+            case "bodyguard_apply_lifecycle":
+                let backend = GuardBackendFixture()
+                backend.writeDelay = 0.2
+                let settings = backend.model()
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm, guardSettings: settings)
+                let app = NSApplication.shared
+                app.setActivationPolicy(.accessory)
+                delegate.showMainWindow()
+                settings.refresh()
+                try spin { !settings.isBusy }
+                settings.selectedInterval = 5
+                settings.apply()
+                try expect(settings.isApplying && !delegate.canAutoDismiss && vm.canQuit, "应用事务必须独立保护面板，不依赖VM繁忙状态")
+                delegate.dismissOnDeactivation()
+                delegate.recheckFromMenu()
+                try expect(delegate.mainWindow?.isVisible == true && f.calls.isEmpty, "授权期间失焦与菜单重检不能启动审计或收起面板")
+                try expect(delegate.applicationShouldTerminate(app) == .terminateCancel, "授权应用期间系统退出也必须被阻止")
+                try spin { !settings.isBusy }
+                try expect(settings.current?.verifiedInterval == 5 && f.calls.isEmpty, "应用后台周期不能隐式运行核心或切换账号")
+                try expect(delegate.applicationShouldTerminate(app) == .terminateNow && delegate.canAutoDismiss, "事务结束后必须解除退出与失焦保护")
+                delegate.recheckFromMenu()
+                try f.idle(vm)
+                try expect(f.calls == ["checkdetail", "get-client", "status"], "应用完成后菜单重检应恢复原有完整检查链路")
+                delegate.hidePanel()
+            case "bodyguard_search_operation_guard":
+                let backend = GuardBackendFixture()
+                backend.writeDelay = 0.2
+                let settings = backend.model()
+                let vm = f.vm()
+                let view = QuickPanelView(vm: vm, onDismiss: {}, guardSettings: settings)
+                settings.refresh()
+                try spin { !settings.isBusy }
+                settings.selectedInterval = 5
+                settings.apply()
+                try expect(settings.isApplying, "应先进入后台配置应用事务")
+                for query in ["B", "修复", "重新检查"] {
+                    view.performSearchResult(for: query)
+                }
+                try expect(f.calls.isEmpty && !vm.isBusy && vm.current == "?", "搜索回车不能绕过授权期间的操作互斥")
+                try spin { !settings.isBusy }
+                view.performSearchResult(for: "B")
+                try f.idle(vm)
+                try expect(backend.writes == [5] && settings.current?.verifiedInterval == 5, "搜索操作不得改变后台应用结果")
+                try expect(f.calls == ["checkdetail", "get-client", "status", "switch B"] && vm.current == "B", "事务结束后搜索切换必须恢复完整审计和账号切换")
             case "snapshot_status_semantics":
                 let vm = f.vm()
                 let initial = WidgetStatusSnapshot.capture(vm, checkedAt: 0)

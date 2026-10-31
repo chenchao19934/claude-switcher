@@ -50,6 +50,16 @@ elif command == "switch" and len(args) == 2 and args[1] in "ABCD" and len(args[1
     print("OK:隔离演示切换至 " + args[1] + "（未启动 Claude）")
 elif command == "get-client" and len(args) == 1:
     print("client=" + state["client"])
+elif command == "get-bodyguard-interval" and len(args) == 1:
+    value = state.get("bodyguardInterval", 10)
+    print(json.dumps({"interval": value, "throttleInterval": value, "registered": True, "activeInterval": value}))
+elif command == "set-bodyguard-interval" and len(args) == 2:
+    if not args[1].isdigit() or not 2 <= int(args[1]) <= 10:
+        fail("保镖模拟周期必须为 2–10 秒")
+    value = int(args[1])
+    state["bodyguardInterval"] = value
+    save()
+    print(json.dumps({"interval": value, "throttleInterval": value, "registered": True, "activeInterval": value}))
 elif command == "set-client" and len(args) == 2 and args[1] in clients:
     state["client"] = args[1]
     save()

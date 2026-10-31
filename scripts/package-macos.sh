@@ -128,23 +128,25 @@ hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$DMG_STAGE" \
 echo "==> 生成 installer kit"
 KIT_ROOT="$WORK/$KIT_NAME"
 mkdir -p "$KIT_ROOT"
-for FILE in README.md README.en.md AGENTS.md SECURITY.md LICENSE; do
+for FILE in README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS; do
     cp "$ROOT/$FILE" "$KIT_ROOT/"
 done
 for DIR in core daemons installer app; do
     ditto "$ROOT/$DIR" "$KIT_ROOT/$DIR"
 done
 mkdir -p "$KIT_ROOT/assets" "$KIT_ROOT/docs"
+mkdir -p "$KIT_ROOT/docs/images"
 mkdir -p "$KIT_ROOT/scripts"
 cp "$ROOT/scripts/build-macos-widget.sh" "$ROOT/scripts/package-macos.sh" "$KIT_ROOT/scripts/"
 cp "$ROOT/docs/MACOS-WIDGET.md" "$KIT_ROOT/docs/"
 cp "$ROOT/assets/icon-2048.png" "$KIT_ROOT/assets/"
 cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
+cp "$ROOT/docs/images/macos-background-polling.png" "$KIT_ROOT/docs/images/"
 chmod +x "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command"
 for ITEM in \
-    README.md README.en.md AGENTS.md SECURITY.md LICENSE \
-    core/claude-switch.sh daemons/claude-bodyguard.sh installer/安装.command \
-    app/main.swift assets/icon-2048.png docs/screenshot.png; do
+    README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS \
+    core/claude-switch.sh daemons/claude-bodyguard.sh daemons/bodyguard-settings.py installer/安装.command \
+    app/main.swift assets/icon-2048.png docs/screenshot.png docs/images/macos-background-polling.png; do
     if [ ! -e "$KIT_ROOT/$ITEM" ]; then
         echo "✗ installer kit 缺少 $ITEM" >&2
         exit 1

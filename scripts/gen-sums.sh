@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.." || exit 1
 shasum -a 256 \
     core/claude-switch.sh \
     daemons/claude-bodyguard.sh \
+    daemons/bodyguard-settings.py \
     daemons/tz-watchdog.sh \
     daemons/local.claude-bodyguard.plist \
     daemons/local.tz-watchdog.plist \

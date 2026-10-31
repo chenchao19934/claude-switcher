@@ -288,12 +288,40 @@ sed -e "s|__HOME__|$H|g" -e "s|__PROXY_MODE__|$MODE|g" \
 sed -e "s|__HOME__|$H|g" -e "s|__TZ_TARGET__|$TZV|g" \
     "$REPO/daemons/tz-watchdog.sh" > "$STAGE/tz-watchdog.sh"
 chmod +x "$STAGE/claude-bodyguard.sh" "$STAGE/tz-watchdog.sh"
+cp "$REPO/daemons/bodyguard-settings.py" "$STAGE/bodyguard-settings.py"
+chmod 755 "$STAGE/bodyguard-settings.py"
 # 清理旧版本装在用户目录下的守护脚本(用户可写=提权面)
 rm -f "$H/.local/bin/claude-bodyguard.sh" "$H/.local/bin/tz-watchdog.sh" \
       "$H/.local/bin/claude-bodyguard.sh.bak" "$H/.local/bin/tz-watchdog.sh.bak"
 
 # launchd 配置(保镖/看门狗的 ProgramArguments 已指向系统目录,直接拷贝;自动更新为 LaunchAgent)
 cp "$REPO/daemons/local.claude-bodyguard.plist" "$REPO/daemons/local.tz-watchdog.plist" "$H/.local/bin/"
+# 重装时保留已受信任配置中的安全周期；旧版缺省仍为 10 秒。
+/usr/bin/python3 -I -B - "$H/.local/bin/local.claude-bodyguard.plist" <<'PY'
+import os
+from pathlib import Path
+import plistlib
+import stat
+import sys
+source = Path('/Library/LaunchDaemons/local.claude-bodyguard.plist')
+target = Path(sys.argv[1])
+try:
+    metadata = source.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022:
+        raise ValueError('untrusted configuration')
+    with os.fdopen(os.open(str(source), os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+        previous = plistlib.load(stream)
+    interval = previous.get('StartInterval')
+    if (previous.get('Label') != 'local.claude-bodyguard' or
+        previous.get('ProgramArguments') != ['/bin/bash', '/Library/Application Support/claude-switcher/claude-bodyguard.sh'] or
+        type(interval) is not int or not 2 <= interval <= 10):
+        raise ValueError('invalid configuration')
+    current = plistlib.loads(target.read_bytes())
+    current.update(StartInterval=interval, ThrottleInterval=interval)
+    target.write_bytes(plistlib.dumps(current))
+except (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException):
+    pass
+PY
 sed "s|__HOME__|$H|g" "$REPO/daemons/local.claude-update.plist" > "$H/.local/bin/local.claude-update.plist"
 echo "✓ 核心文件已安装"
 
@@ -369,10 +397,20 @@ if [ -n "$DRYRUN" ]; then
     rm -rf "$STAGE"
 else
     # 守护脚本装入 root 所有的系统目录;同时清理旧版的 root 级自动更新(已改为用户态 LaunchAgent)
-    SYSCMDS="mkdir -p '/Library/Application Support/claude-switcher';
-        cp '$STAGE/claude-bodyguard.sh' '$STAGE/tz-watchdog.sh' '/Library/Application Support/claude-switcher/';
-        chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh';
-        chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh';
+    SYSCMDS="if [ -L '/Library/Application Support/claude-switcher' ]; then echo '拒绝符号链接系统目录'; exit 1; fi;
+        mkdir -p '/Library/Application Support/claude-switcher' || exit 1;
+        chown root:wheel '/Library/Application Support/claude-switcher' || exit 1;
+        chmod -N '/Library/Application Support/claude-switcher' 2>/dev/null || true;
+        chmod 755 '/Library/Application Support/claude-switcher' || exit 1;
+        for guard_file in claude-bodyguard.sh tz-watchdog.sh bodyguard-settings.py; do
+            if [ -L \"/Library/Application Support/claude-switcher/\$guard_file\" ]; then echo '拒绝符号链接守护文件'; exit 1; fi;
+            if [ -e \"/Library/Application Support/claude-switcher/\$guard_file\" ] && [ ! -f \"/Library/Application Support/claude-switcher/\$guard_file\" ]; then echo '拒绝异常守护文件类型'; exit 1; fi;
+        done;
+        cp '$STAGE/claude-bodyguard.sh' '$STAGE/tz-watchdog.sh' '$STAGE/bodyguard-settings.py' '/Library/Application Support/claude-switcher/' || exit 1;
+        chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' '/Library/Application Support/claude-switcher/bodyguard-settings.py' || exit 1;
+        chmod -N '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' '/Library/Application Support/claude-switcher/bodyguard-settings.py' 2>/dev/null || true;
+        chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' '/Library/Application Support/claude-switcher/bodyguard-settings.py' || exit 1;
+        if [ -L '/Library/LaunchDaemons/local.claude-bodyguard.plist' ] || [ -L '/Library/LaunchDaemons/local.tz-watchdog.plist' ]; then echo '拒绝符号链接服务配置'; exit 1; fi;
         cp '$H/.local/bin/local.claude-bodyguard.plist' '$H/.local/bin/local.tz-watchdog.plist' /Library/LaunchDaemons/;
         chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
         chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
@@ -400,11 +438,53 @@ else
     fi
 fi
 
+wait_for_clash_ready() {
+    local maximum="${1:-30}" elapsed
+    case "$maximum" in ''|*[!0-9]*) return 2 ;; esac
+    for ((elapsed=0; elapsed<=maximum; elapsed++)); do
+        if pgrep -f verge-mihomo >/dev/null 2>&1 && \
+           ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; then
+            return 0
+        fi
+        [ "$elapsed" -lt "$maximum" ] && sleep 1
+    done
+    return 1
+}
+
+installation_checks_pass() {
+    [ "${1:-1}" = "0" ] || return 1
+    /usr/bin/python3 -I -B -c '
+import sys
+expected = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6",
+            "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性")
+optional = set(("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性"))
+seen = set()
+for raw in sys.stdin:
+    line = raw.rstrip("\r\n")
+    if not line.strip() or line.startswith("#"):
+        continue
+    key, separator, value = line.partition("=")
+    state = value.partition(":")[0]
+    if not separator or key not in expected or key in seen or state not in ("ok", "warn", "skip"):
+        sys.exit(1)
+    if key not in optional and state != "ok":
+        sys.exit(1)
+    seen.add(key)
+sys.exit(0 if seen == set(expected) else 1)
+'
+}
+
 # ---- 7. 重启 Clash 使规则生效(仅 Clash Verge) ----
+INSTALLATION_READY=1
 if [ -z "$DRYRUN" ] && [ "$MODE" = "clash-verge" ]; then
     osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
     sleep 2
     open -a "Clash Verge" >/dev/null 2>&1
+    echo "等待 Clash 内核与 TUN 就绪(最长约 30 秒)..."
+    if ! wait_for_clash_ready 30; then
+        INSTALLATION_READY=0
+        echo "✗ Clash 内核或 TUN 未就绪，已跳过网络自检，避免未接管时探测出口。"
+    fi
 fi
 
 # ---- 8. 自检 ----
@@ -412,14 +492,31 @@ echo ""
 echo "=================================="
 echo "  自检结果 (checkdetail)"
 echo "=================================="
-"$H/.local/bin/claude-switch.sh" checkdetail 2>&1 || true
+INSTALLATION_RESULT=1
+if [ "$INSTALLATION_READY" -eq 1 ]; then
+    CHECK_OUTPUT=$("$H/.local/bin/claude-switch.sh" checkdetail 2>&1)
+    CHECK_RC=$?
+    printf '%s\n' "$CHECK_OUTPUT"
+    if printf '%s\n' "$CHECK_OUTPUT" | installation_checks_pass "$CHECK_RC"; then
+        INSTALLATION_RESULT=0
+    fi
+else
+    echo "自检未执行：请先确认 Clash 内核与 TUN 已恢复。"
+fi
 
 echo ""
 echo "=================================="
-echo "  ✅ 安装完成!"
-echo "  使用: 双击桌面「Claude切换器」"
-echo "  首次使用: 打开后选账号A(自动收编当前登录)"
-echo "  换了其他国家节点后: 运行 claude-switch.sh set-region 一键重新适配"
-echo "  自动更新已启用(每12小时检查一次),也可手动: claude-switch.sh update"
+if [ "$INSTALLATION_RESULT" -eq 0 ]; then
+    echo "  ✅ 安装完成!"
+    echo "  使用: 双击桌面「Claude切换器」"
+    echo "  首次使用: 打开后选账号A(自动收编当前登录)"
+    echo "  换了其他国家节点后: 运行 claude-switch.sh set-region 一键重新适配"
+    echo "  自动更新已启用(每12小时检查一次),也可手动: claude-switch.sh update"
+else
+    echo "  ⚠️ 安装文件已就位，但环境尚未通过验收"
+    echo "  请确认代理与 TUN 就绪，处理失败项后重新运行 checkdetail。"
+    echo "  环境未通过前请勿启动 Claude。"
+fi
 echo "=================================="
 read -n 1 -s -r -p "按任意键关闭窗口..."
+exit "$INSTALLATION_RESULT"

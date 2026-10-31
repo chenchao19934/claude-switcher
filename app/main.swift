@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 import Carbon
 import Combine
 import WidgetKit
+import Darwin
 
 // MARK: - 模型
 
@@ -1405,6 +1406,7 @@ private enum QuickPanelAction: String, CaseIterable {
 
 struct QuickPanelView: View {
     @ObservedObject var vm: VM
+    @ObservedObject var guardSettings: BodyguardSettings
     let onDismiss: () -> Void
     let shortcutSettings: AnyView
     @State private var page = QuickPanelPage.home
@@ -1412,14 +1414,17 @@ struct QuickPanelView: View {
     @State private var copied = false
     @FocusState private var searchFocused: Bool
 
-    init(vm: VM, onDismiss: @escaping () -> Void, shortcutSettings: AnyView = AnyView(EmptyView())) {
+    init(vm: VM, onDismiss: @escaping () -> Void, shortcutSettings: AnyView = AnyView(EmptyView()),
+         guardSettings: BodyguardSettings = .unavailable()) {
         self.vm = vm
+        self.guardSettings = guardSettings
         self.onDismiss = onDismiss
         self.shortcutSettings = shortcutSettings
     }
 
     private var term: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var matchingAccounts: [String] {
+    private var matchingAccounts: [String] { accountsMatching(term) }
+    private func accountsMatching(_ term: String) -> [String] {
         VM.accountLetters.filter { account in
             if term.isEmpty { return true }
             if term.count == 1 && "ABCD".localizedCaseInsensitiveContains(term) {
@@ -1428,10 +1433,12 @@ struct QuickPanelView: View {
             return "账号 \(account) account \(account)".localizedCaseInsensitiveContains(term)
         }
     }
-    private var matchingActions: [QuickPanelAction] {
+    private var matchingActions: [QuickPanelAction] { actionsMatching(term) }
+    private func actionsMatching(_ term: String) -> [QuickPanelAction] {
         QuickPanelAction.allCases.filter { term.isEmpty || ($0.title + " " + $0.keywords).localizedCaseInsensitiveContains(term) }
     }
-    private var matchingChecks: [CheckRow] {
+    private var matchingChecks: [CheckRow] { checksMatching(term) }
+    private func checksMatching(_ term: String) -> [CheckRow] {
         vm.rows.filter { term.isEmpty || ($0.name + " " + $0.detail).localizedCaseInsensitiveContains(term) }
     }
     private var summaryColor: Color {
@@ -1461,6 +1468,7 @@ struct QuickPanelView: View {
                 .padding(24)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .disabled(guardSettings.isApplying)
             footer
         }
         .frame(width: 760, height: 560)
@@ -1504,7 +1512,7 @@ struct QuickPanelView: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 23, weight: .regular))
                     .focused($searchFocused)
-                    .onSubmit { performSearchResult() }
+                    .onSubmit { performSearchResult(for: query) }
                     .accessibilityLabel("搜索账号、检查或操作")
             } else {
                 Text(page.rawValue)
@@ -1642,7 +1650,10 @@ struct QuickPanelView: View {
 
     private func accountButton(_ account: String) -> some View {
         let active = vm.current == account
-        return Button { vm.switchTo(account) } label: {
+        return Button {
+            guard !guardSettings.isApplying else { return }
+            vm.switchTo(account)
+        } label: {
             HStack(spacing: 11) {
                 Text(account).font(.system(size: 22, weight: .medium, design: .rounded))
                     .frame(width: 40, height: 43)
@@ -1698,6 +1709,7 @@ struct QuickPanelView: View {
     }
 
     private func perform(_ action: QuickPanelAction) {
+        guard !guardSettings.isApplying else { return }
         switch action {
         case .check: vm.refresh()
         case .fix: vm.fixAll()
@@ -1708,18 +1720,20 @@ struct QuickPanelView: View {
         }
     }
 
-    private func performSearchResult() {
+    func performSearchResult(for query: String) {
+        guard !guardSettings.isApplying else { return }
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !term.isEmpty else { return }
-        if let account = matchingAccounts.first { vm.switchTo(account) }
-        else if let action = matchingActions.first { perform(action) }
-        else if !matchingChecks.isEmpty { show(.checks) }
+        if let account = accountsMatching(term).first { vm.switchTo(account) }
+        else if let action = actionsMatching(term).first { perform(action) }
+        else if !checksMatching(term).isEmpty { show(.checks) }
     }
 
     private func show(_ destination: QuickPanelPage) {
         page = destination
         query = ""
         searchFocused = destination == .home
-        if destination == .settings { vm.loadCheckConfig() }
+        if destination == .settings { vm.loadCheckConfig(); guardSettings.refresh() }
     }
 
     private func consumeNavigationRequest() {
@@ -1802,6 +1816,7 @@ struct QuickPanelView: View {
         VStack(alignment: .leading, spacing: 18) {
             detailIntro("检查偏好", subtitle: "只允许自定义以下六项非关键检查；硬性安全项始终执行")
             shortcutSettings
+            BodyguardSettingsView(settings: guardSettings, operationsBusy: vm.isBusy || vm.settingsBusy)
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 13) {
                 ForEach(VM.optionalChecks, id: \.key) { item in
                     Toggle(item.label, isOn: Binding(
@@ -1964,6 +1979,295 @@ struct QuickPanelView: View {
         }
     }
 }
+
+// MARK: - 后台保镖巡检设置
+
+struct BodyguardIntervalStatus: Decodable, Equatable {
+    let interval: Int
+    let throttleInterval: Int
+    let registered: Bool
+    let activeInterval: Int?
+
+    var verifiedInterval: Int? {
+        guard registered, (2...10).contains(interval), interval == throttleInterval,
+              activeInterval == interval else { return nil }
+        return interval
+    }
+
+    static func decode(_ text: String) -> BodyguardIntervalStatus? {
+        guard let data = text.data(using: .utf8), data.count <= 4096,
+              let status = try? JSONDecoder().decode(Self.self, from: data),
+              (2...10).contains(status.interval), (2...10).contains(status.throttleInterval),
+              status.activeInterval.map({ (2...10).contains($0) }) ?? true else { return nil }
+        return status
+    }
+}
+
+struct BodyguardCommandResult {
+    let output: String
+    let succeeded: Bool
+    var cancelled = false
+}
+
+final class BodyguardSettings: ObservableObject {
+    @Published private(set) var current: BodyguardIntervalStatus?
+    @Published var selectedInterval = 10
+    @Published private(set) var isBusy = false
+    @Published private(set) var isApplying = false
+    @Published private(set) var message = ""
+    let isDemo: Bool
+    var canStartApplication: () -> Bool = { true }
+    private let readStatus: () -> BodyguardCommandResult
+    private let writeInterval: (Int) -> BodyguardCommandResult
+    private static let helper = "/Library/Application Support/claude-switcher/bodyguard-settings.py"
+
+    init(isDemo: Bool = false, readStatus: @escaping () -> BodyguardCommandResult,
+         writeInterval: @escaping (Int) -> BodyguardCommandResult) {
+        self.isDemo = isDemo
+        self.readStatus = readStatus
+        self.writeInterval = writeInterval
+    }
+
+    static func unavailable() -> BodyguardSettings {
+        BodyguardSettings(readStatus: { BodyguardCommandResult(output: "", succeeded: false) },
+                          writeInterval: { _ in BodyguardCommandResult(output: "", succeeded: false) })
+    }
+
+    // 固定 root helper，管理员命令中唯一的可变输入是已校验的整数。
+    static func live() -> BodyguardSettings {
+        BodyguardSettings(readStatus: {
+            guard helperIsTrusted() else { return BodyguardCommandResult(output: "", succeeded: false) }
+            return run(executable: "/usr/bin/python3", arguments: ["-I", "-B", helper, "status"], timeout: 15)
+        }, writeInterval: { interval in
+            guard (2...10).contains(interval), helperIsTrusted() else {
+                return BodyguardCommandResult(output: "", succeeded: false)
+            }
+            let command = "/usr/bin/python3 -I -B '\(helper)' apply \(interval)"
+            let source = "do shell script \"\(command)\" with administrator privileges"
+            // 授权等待不占用事务超时，避免在 root 重载/回滚中途强杀父进程。
+            return run(executable: "/usr/bin/osascript", arguments: ["-e", source], timeout: nil)
+        })
+    }
+
+    static func demo(core: String) -> BodyguardSettings {
+        BodyguardSettings(isDemo: true, readStatus: {
+            run(executable: "/bin/bash", arguments: [core, "get-bodyguard-interval"], timeout: 5)
+        }, writeInterval: { interval in
+            guard (2...10).contains(interval) else { return BodyguardCommandResult(output: "", succeeded: false) }
+            return run(executable: "/bin/bash", arguments: [core, "set-bodyguard-interval", String(interval)], timeout: 5)
+        })
+    }
+
+    var canApply: Bool {
+        guard !isBusy, (2...10).contains(selectedInterval), let current = current, current.registered else { return false }
+        return current.verifiedInterval != selectedInterval
+    }
+
+    func refresh() {
+        guard !isBusy else { return }
+        isBusy = true
+        message = "正在读取后台配置…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = self.readStatus()
+            DispatchQueue.main.async {
+                self.isBusy = false
+                guard result.succeeded, let status = BodyguardIntervalStatus.decode(result.output) else {
+                    self.current = nil
+                    self.message = "无法确认后台周期。配置组件缺失或权限不可信时，需重新运行安装器；未修改系统设置。"
+                    return
+                }
+                self.current = status
+                self.selectedInterval = status.interval
+                if !status.registered { self.message = "保镖尚未注册，请重新运行安装器；此处不会自动安装服务。" }
+                else if status.verifiedInterval == nil { self.message = "磁盘配置与当前调度未确认一致，可重新授权应用后核对。" }
+                else { self.message = self.isDemo ? "隔离演示：只更新仓库内假数据。" : "已核对系统调度；实际触发仍受睡眠、任务耗时等影响。" }
+            }
+        }
+    }
+
+    func apply() {
+        guard !isBusy else { return }
+        guard (2...10).contains(selectedInterval) else {
+            message = "巡检周期仅支持 2–10 秒，不能停用或延长现有保护基线。"
+            return
+        }
+        guard canApply, canStartApplication() else {
+            message = "请等待当前操作完成，并先读取已注册的保镖状态。"
+            return
+        }
+        let requested = selectedInterval
+        isBusy = true; isApplying = true
+        message = isDemo ? "正在模拟应用…" : "请完成系统管理员授权，正在应用并核对后台调度…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = self.writeInterval(requested)
+            DispatchQueue.main.async {
+                self.isBusy = false; self.isApplying = false
+                if result.cancelled {
+                    self.message = "已取消管理员授权，保留原后台周期。"
+                } else if result.succeeded, let status = BodyguardIntervalStatus.decode(result.output),
+                          status.verifiedInterval == requested {
+                    self.current = status
+                    self.selectedInterval = requested
+                    self.message = self.isDemo ? "模拟周期已更新为 \(requested) 秒；真实服务未改动。" : "已核对后台调度为 \(requested) 秒；无需保持面板打开。"
+                } else {
+                    self.current = nil
+                    self.message = "未确认配置成功；请刷新核对后台实际状态。若重载失败，配置组件会尝试恢复旧配置；无法恢复时请重跑安装器。"
+                }
+            }
+        }
+    }
+
+    private static func helperIsTrusted() -> Bool {
+        for path in ["/Library", "/Library/Application Support"] {
+            var attributes = stat()
+            guard !FileManager.default.isWritableFile(atPath: path),
+                  lstat(path, &attributes) == 0, attributes.st_uid == 0,
+                  attributes.st_mode & S_IFMT == S_IFDIR, attributes.st_mode & 0o022 == 0 else { return false }
+        }
+        for (path, expectedType, expectedMode) in [("/Library/Application Support/claude-switcher", mode_t(S_IFDIR), mode_t(0o755)),
+                                                   (helper, mode_t(S_IFREG), mode_t(0o755))] {
+            var attributes = stat()
+            guard !FileManager.default.isWritableFile(atPath: path),
+                  lstat(path, &attributes) == 0, attributes.st_uid == 0, attributes.st_gid == 0,
+                  attributes.st_mode & S_IFMT == expectedType, attributes.st_mode & 0o7777 == expectedMode else { return false }
+        }
+        return true
+    }
+
+    private static func run(executable: String, arguments: [String], timeout: TimeInterval?) -> BodyguardCommandResult {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("bodyguard-settings-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]),
+              let output = try? FileHandle(forWritingTo: file) else { return BodyguardCommandResult(output: "", succeeded: false) }
+        defer { try? output.close(); try? FileManager.default.removeItem(at: file) }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = output
+        do { try process.run() } catch { return BodyguardCommandResult(output: "", succeeded: false) }
+        let deadline = ProcessDeadline()
+        let watchdog = timeout.map { timeout -> DispatchWorkItem in
+            let item = DispatchWorkItem { deadline.expire(process) }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: item)
+            return item
+        }
+        process.waitUntilExit()
+        watchdog?.cancel()
+        let text = String(decoding: (try? Data(contentsOf: file)) ?? Data(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return BodyguardCommandResult(output: text, succeeded: !deadline.timedOut && process.terminationStatus == 0,
+                                      cancelled: text.contains("(-128)"))
+    }
+}
+
+import SwiftUI
+
+struct BodyguardSettingsView: View {
+    @ObservedObject var settings: BodyguardSettings
+    let operationsBusy: Bool
+
+    private var busy: Bool { settings.isBusy || settings.isApplying || operationsBusy }
+    private var verifiedInterval: Int? { settings.current?.verifiedInterval }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "shield.lefthalf.filled")
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundColor(ClaudeTheme.terracottaDeep)
+                    .frame(width: 30, height: 30)
+                    .background(ClaudeTheme.terracottaTint)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 7) {
+                        Text("后台保镖巡检")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(ClaudeTheme.ink)
+                        if settings.isDemo {
+                            Text("演示")
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundColor(ClaudeTheme.terracottaDeep)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(ClaudeTheme.terracottaTint)
+                                .clipShape(Capsule())
+                        }
+                    }
+                    HStack(spacing: 4) {
+                        Text(settings.isDemo ? "模拟生效周期" : "当前实际周期")
+                        Text(verifiedInterval.map { "\($0) 秒" } ?? "未确认")
+                            .fontWeight(.medium)
+                            .foregroundColor(verifiedInterval == nil ? ClaudeTheme.warning : ClaudeTheme.ink)
+                        if verifiedInterval == nil, let status = settings.current {
+                            Text("· 配置为 \(status.interval) 秒")
+                        }
+                    }
+                    .font(.system(size: 10))
+                    .foregroundColor(ClaudeTheme.muted)
+                }
+                Spacer(minLength: 0)
+                if settings.isBusy || settings.isApplying {
+                    ProgressView().controlSize(.small).frame(width: 18, height: 25)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Text("巡检间隔")
+                    .font(.system(size: 12))
+                    .foregroundColor(ClaudeTheme.ink)
+                Text("2–10 秒 · 默认 10 秒")
+                    .font(.system(size: 10))
+                    .foregroundColor(ClaudeTheme.muted)
+                Spacer(minLength: 4)
+                Stepper(value: $settings.selectedInterval, in: 2...10, step: 1) {
+                    Text("\(settings.selectedInterval) 秒")
+                        .font(.system(size: 12, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundColor(ClaudeTheme.ink)
+                        .frame(minWidth: 36, alignment: .trailing)
+                }
+                .fixedSize()
+                .disabled(busy)
+                .accessibilityLabel("后台保镖巡检间隔，2 到 10 秒")
+            }
+
+            Text("只检查代理内核与 TUN，退出 App 后仍独立运行；不执行完整 14 项网络审计。")
+                .font(.system(size: 10))
+                .foregroundColor(ClaudeTheme.muted)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                Button("刷新状态") { settings.refresh() }
+                    .controlSize(.small)
+                    .disabled(busy)
+                Spacer(minLength: 4)
+                Text(settings.isDemo ? "仅更新演示数据" : "需要管理员授权")
+                    .font(.system(size: 10))
+                    .foregroundColor(ClaudeTheme.muted)
+                Button(settings.isApplying ? "正在应用…" : (settings.isDemo ? "模拟应用" : "授权并应用")) {
+                    settings.apply()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(ClaudeTheme.terracottaDeep)
+                .disabled(busy || !settings.canApply)
+            }
+
+            if !settings.message.isEmpty {
+                Text(settings.message)
+                    .font(.system(size: 10))
+                    .foregroundColor(ClaudeTheme.muted)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(15)
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(ClaudeTheme.cardBorder))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("后台保镖巡检设置")
+    }
+}
+
 
 // MARK: - 呼出快捷键与展示偏好
 
@@ -2248,6 +2552,7 @@ private final class QuickAccessPanel: NSPanel {
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     let vm: VM
     let preferences: AppPreferences
+    let guardSettings: BodyguardSettings
     private(set) var mainWindow: NSWindow?
     private(set) var statusItem: NSStatusItem?
     private let hotKey = GlobalHotKey()
@@ -2263,21 +2568,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
     override init() {
         vm = VM()
         preferences = AppPreferences(defaults: .standard)
+        guardSettings = .live()
         enableSystemIntegration = true
         super.init()
         configurePreferences()
     }
 
     // 测试默认关闭系统快捷键与共享容器写入，且不保存真实用户偏好。
-    init(vm: VM, preferences: AppPreferences = AppPreferences(), enableSystemIntegration: Bool = false) {
+    init(vm: VM, preferences: AppPreferences = AppPreferences(), enableSystemIntegration: Bool = false,
+         guardSettings: BodyguardSettings = .unavailable()) {
         self.vm = vm
         self.preferences = preferences
+        self.guardSettings = guardSettings
         self.enableSystemIntegration = enableSystemIntegration
         super.init()
         configurePreferences()
     }
 
     private func configurePreferences() {
+        guardSettings.canStartApplication = { [weak self] in
+            guard let self = self else { return false }
+            return !self.vm.isBusy && !self.vm.settingsBusy
+        }
         preferences.requestShortcut = { [weak self] candidate in self?.setShortcut(candidate) }
         hotKey.onPress = { [weak self] timestamp in
             self?.handleShortcutPress(timestamp: timestamp)
@@ -2382,11 +2694,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
                 menu.addItem(entry)
             }
             item("呼出快捷面板", #selector(menuOpen))
-            item("重新检查", #selector(menuRefresh), enabled: !vm.isBusy)
+            item("重新检查", #selector(menuRefresh), enabled: !vm.isBusy && !guardSettings.isApplying)
             item("检查设置与快捷键", #selector(menuSettings))
             item("检查更新", #selector(menuUpdate))
             menu.addItem(.separator())
-            item("退出 Claude 切换器", #selector(menuQuit), enabled: vm.canQuit)
+            item("退出 Claude 切换器", #selector(menuQuit), enabled: vm.canQuit && !guardSettings.isApplying)
             statusItem?.menu = menu
             statusItem?.button?.performClick(nil)
         } else {
@@ -2396,11 +2708,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
 
     func menuDidClose(_ menu: NSMenu) { statusItem?.menu = nil }
     @objc private func menuOpen() { showMainWindow() }
-    func recheckFromMenu() { vm.refresh(); showMainWindow() }
+    func recheckFromMenu() {
+        guard !guardSettings.isApplying else { return }
+        vm.refresh(); showMainWindow()
+    }
     @objc private func menuRefresh() { recheckFromMenu() }
     @objc private func menuSettings() { showMainWindow(); vm.showSettingsSheet = true }
     @objc private func menuUpdate() { showMainWindow(); vm.checkUpdate(); vm.showUpdateSheet = true }
-    @objc private func menuQuit() { if vm.canQuit { NSApplication.shared.terminate(nil) } }
+    @objc private func menuQuit() { if vm.canQuit && !guardSettings.isApplying { NSApplication.shared.terminate(nil) } }
 
     func togglePanel() {
         if mainWindow?.isVisible == true { hidePanel() }
@@ -2435,7 +2750,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             panel.contentView = NSHostingView(rootView: QuickPanelView(vm: vm,
                 onDismiss: { [weak self] in self?.hidePanel() },
-                shortcutSettings: AnyView(ShortcutSettingsView(preferences: preferences))))
+                shortcutSettings: AnyView(ShortcutSettingsView(preferences: preferences)),
+                guardSettings: guardSettings))
             panel.delegate = self
             mainWindow = panel
         }
@@ -2449,7 +2765,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
     }
 
     var canAutoDismiss: Bool {
-        guard !vm.isBusy, !vm.settingsBusy, !preferences.isRecordingShortcut,
+        guard !vm.isBusy, !vm.settingsBusy, !guardSettings.isBusy, !preferences.isRecordingShortcut,
               NSApplication.shared.modalWindow == nil, mainWindow?.attachedSheet == nil else { return false }
         return !(mainWindow?.childWindows?.contains(where: { $0.isVisible }) ?? false)
     }
@@ -2473,7 +2789,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { hidePanel(); return false }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply { vm.canQuit ? .terminateNow : .terminateCancel }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        vm.canQuit && !guardSettings.isApplying ? .terminateNow : .terminateCancel
+    }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showMainWindow(); return false }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -2491,6 +2809,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
 struct MenuBarContent: View {
     @ObservedObject var vm: VM
     let showWindow: () -> Void
+    var canOperate: () -> Bool = { true }
 
     var body: some View {
         Text("Claude 切换器")
@@ -2502,10 +2821,11 @@ struct MenuBarContent: View {
         Button("打开主窗口", action: showWindow)
             .keyboardShortcut("o")
         Button("重新检查") {
+            guard canOperate() else { return }
             vm.refresh()
             showWindow()
         }
-        .disabled(vm.isBusy)
+        .disabled(vm.isBusy || !canOperate())
         Button("检查更新") {
             showWindow()
             vm.checkUpdate()
@@ -2515,10 +2835,10 @@ struct MenuBarContent: View {
             showWindow()
             vm.showSettingsSheet = true
         }
-        Button("导出诊断日志") { vm.exportDiagnostics() }
+        Button("导出诊断日志") { if canOperate() { vm.exportDiagnostics() } }
             .disabled(vm.settingsBusy)
         Divider()
-        Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }
+        Button("退出 Claude 切换器") { if canOperate() { NSApplication.shared.terminate(nil) } }
             .keyboardShortcut("q")
             .disabled(!vm.canQuit)
             .onAppear { vm.refreshAccountStatus() }
@@ -2528,7 +2848,14 @@ struct MenuBarContent: View {
 // 生产应用与 UI 测试共用完全相同的菜单和窗口管理。
 struct SwitcherMenu: Scene {
     @ObservedObject var vm: VM
+    @ObservedObject private var guardSettings: BodyguardSettings
     let controller: AppDelegate
+
+    init(vm: VM, controller: AppDelegate) {
+        self.vm = vm
+        self.controller = controller
+        guardSettings = controller.guardSettings
+    }
 
     var body: some Scene {
         Settings { EmptyView() }
@@ -2536,7 +2863,7 @@ struct SwitcherMenu: Scene {
             CommandGroup(replacing: .appTermination) {
                 Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }
                     .keyboardShortcut("q")
-                    .disabled(!vm.canQuit)
+                    .disabled(!vm.canQuit || guardSettings.isApplying)
             }
         }
     }
