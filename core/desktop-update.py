@@ -621,9 +621,17 @@ class Updater:
             raise UpdateError("核心脚本路径必须为当前用户的安装路径")
         if self.app.suffix != ".app":
             raise UpdateError("更新目标必须为已安装的 App")
-        for target in (self.app, self.app.parent, self.core, self.core.parent, self.stun.parent):
+        for target in (self.app, self.core, self.core.parent, self.stun.parent):
             if target.stat().st_uid != os.getuid() or not os.access(target, os.W_OK):
                 raise UpdateError("安装位置不属于当前用户或不可写，请使用安装器更新")
+        parent = ensure_plain(self.app.parent, True)
+        parent_stat = parent.stat()
+        # /Applications can be root-owned while granting the current user write access.
+        # Only the parent directory gets this exception; installed files remain user-owned.
+        parent_owned = parent_stat.st_uid == os.getuid()
+        parent_root_safe = parent_stat.st_uid == 0 and not parent_stat.st_mode & stat.S_IWOTH
+        if not (parent_owned or parent_root_safe) or not os.access(parent, os.W_OK):
+            raise UpdateError("App 所在目录不可由当前用户安全写入，请使用安装器更新")
         info = read_plist(self.app / "Contents/Info.plist")
         if info.get("CFBundleIdentifier") != "local.claude-switcher":
             raise UpdateError("App 标识不匹配，已中止")

@@ -539,6 +539,43 @@ class DesktopUpdateTests(unittest.TestCase):
         self.assertTrue(self.core.read_text().endswith('# changed after preparation\n'))
         self.assertFalse((self.stun.parent / '.update.lock').exists())
 
+    def parent_permissions(self, owner, permissions, writable):
+        original_stat = UPDATE.Path.stat
+        original_access = UPDATE.os.access
+        def fake_stat(path, *args, **kwargs):
+            value = original_stat(path, *args, **kwargs)
+            if path == self.app.parent:
+                return types.SimpleNamespace(st_mode=stat.S_IFDIR | permissions, st_uid=owner,
+                                             st_dev=value.st_dev)
+            return value
+        def fake_access(path, mode, *args, **kwargs):
+            if Path(path) == self.app.parent and mode == os.W_OK:
+                return writable
+            return original_access(path, mode, *args, **kwargs)
+        return mock.patch.object(UPDATE.Path, 'stat', fake_stat), mock.patch.object(UPDATE.os, 'access', side_effect=fake_access)
+
+    def test_root_owned_writable_app_parent_allows_user_owned_update(self):
+        stat_patch, access_patch = self.parent_permissions(0, 0o775, True)
+        before = self.installed()
+        with stat_patch, access_patch:
+            self.updater.validate_targets()
+            token = self.prepare()
+        self.assertEqual(self.installed(), before)
+        self.assertEqual(self.updater.receipt(token)[1]['phase'], 'prepared')
+        self.assertFalse((self.stun.parent / '.update.lock').exists())
+
+    def test_app_parent_rejects_root_unwritable_worldwrite_and_foreign_owner(self):
+        cases = ((0, 0o755, False), (0, 0o777, True), (os.getuid() + 1234, 0o775, True))
+        before = self.installed()
+        for owner, permissions, writable in cases:
+            with self.subTest(owner=owner, permissions=permissions, writable=writable):
+                stat_patch, access_patch = self.parent_permissions(owner, permissions, writable)
+                with stat_patch, access_patch, self.assertRaises(UPDATE.UpdateError):
+                    self.updater.prepare()
+                self.assertEqual(self.installed(), before)
+                self.assertFalse(list(self.app.parent.glob('.claude-switcher-update-*')))
+                self.assertFalse((self.stun.parent / '.update.lock').exists())
+
     def test_cross_volume_install_refused_before_build(self):
         original_stat = UPDATE.Path.stat
         def fake_stat(path, *args, **kwargs):
