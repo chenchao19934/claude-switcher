@@ -49,16 +49,17 @@ struct StatusWidgetEntry: TimelineEntry {
         guard configured else { return "等待配置" }
         guard let snapshot = snapshot else { return "等待检查" }
         if snapshot.checkedAt == 0 { return "尚未检查" }
+        if snapshot.status == "failed" || snapshot.failed > 0 {
+            return snapshot.isStale(at: date) ? "未通过 · 结果已过期" : "检查未通过"
+        }
         if snapshot.isStale(at: date) { return "结果已过期" }
         switch snapshot.status {
         case "checking": return "上次状态：检查中"
         case "fixing": return "上次状态：修复中"
         case "switching": return "上次状态：切换中"
-        case "failed": return "检查未通过"
         case "unknown": return "等待检查"
         default: break
         }
-        if snapshot.failed > 0 { return "检查未通过" }
         if snapshot.pending > 0 { return "检查未完成" }
         if snapshot.warning > 0 { return "有警告" }
         if snapshot.skipped > 0 { return "通过 · 含跳过" }
@@ -66,9 +67,9 @@ struct StatusWidgetEntry: TimelineEntry {
     }
 
     var resultTone: StatusWidgetTone {
-        guard let snapshot = snapshot, snapshot.checkedAt > 0,
-              !snapshot.isStale(at: date) else { return .muted }
+        guard let snapshot = snapshot, snapshot.checkedAt > 0 else { return .muted }
         if snapshot.status == "failed" || snapshot.failed > 0 { return .failure }
+        if snapshot.isStale(at: date) { return .muted }
         if ["checking", "fixing", "switching", "unknown"].contains(snapshot.status) || snapshot.pending > 0 {
             return .muted
         }

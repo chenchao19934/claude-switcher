@@ -24,6 +24,10 @@ SCENARIOS = (
     "bodyguard_cancel_preserves", "bodyguard_apply_unconfirmed", "bodyguard_operation_serialization",
     "bodyguard_vm_busy_denies", "bodyguard_apply_lifecycle",
     "bodyguard_search_operation_guard",
+    "monitor_healthy", "monitor_failure_recovery", "monitor_recovery_still_failed",
+    "monitor_invalid_responses", "monitor_timeout", "monitor_busy_skip", "monitor_no_overlap",
+    "monitor_late_sample", "monitor_hidden_timer_and_stop", "monitor_stop_discards_inflight",
+    "monitor_wake", "monitor_guard_application", "monitor_guard_late_sample",
     "snapshot_status_semantics", "snapshot_privacy",
 )
 

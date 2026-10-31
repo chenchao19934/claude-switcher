@@ -74,7 +74,9 @@ final class VM: ObservableObject {
     @Published var banner = ""
     @Published var note = ""
     @Published var fingerprint = ""
-    @Published private(set) var isBusy = false
+    @Published private(set) var isBusy = false {
+        didSet { if isBusy { operationGeneration &+= 1 } }
+    }
     @Published private(set) var lastCheckSummary = "尚未检查"
     @Published var updateText = ""
     @Published var showUpdateSheet = false
@@ -109,17 +111,28 @@ final class VM: ObservableObject {
     let core: String
     private let checkTimeout: TimeInterval
     private let operationTimeout: TimeInterval
+    private let monitorInterval: TimeInterval?
+    private let monitorTimeout: TimeInterval
+    private var monitorTimer: Timer?
+    private var wakeObserver: NSObjectProtocol?
+    private(set) var monitorInFlight = false
+    private var monitorNeedsAudit = false
+    private var operationGeneration: UInt = 0
     private var started = false
     private var switchRequested = false
     private var checkingUpdate = false
     private var hideAfterSwitch: DispatchWorkItem?
     var onSwitchCompleted: (() -> Void)?
+    var canMonitor: () -> Bool = { true }
 
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
-         checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180) {
+         checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180,
+         monitorInterval: TimeInterval? = 10, monitorTimeout: TimeInterval = 3) {
         self.core = core
         self.checkTimeout = checkTimeout
         self.operationTimeout = operationTimeout
+        self.monitorInterval = monitorInterval
+        self.monitorTimeout = monitorTimeout
     }
 
     var canQuit: Bool { !switchRequested && phase != .fixing && phase != .switching }
@@ -128,6 +141,82 @@ final class VM: ObservableObject {
         guard !started else { return }
         started = true
         refresh()
+        if let interval = monitorInterval, interval > 0 {
+            let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+                self?.pollEnvironment()
+            }
+            // 菜单追踪期间和主窗口隐藏时仍采样，不依赖 SwiftUI 视图生命周期。
+            RunLoop.main.add(timer, forMode: .common)
+            monitorTimer = timer
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in self?.pollEnvironment() }
+        }
+    }
+
+    func stopMonitoring() {
+        monitorTimer?.invalidate()
+        monitorTimer = nil
+        if let observer = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            wakeObserver = nil
+        }
+        // 已发出的只读采样也不能在停止后发布结果。
+        invalidateMonitorSample()
+    }
+
+    func invalidateMonitorSample() { operationGeneration &+= 1 }
+
+    deinit { stopMonitoring() }
+
+    func pollEnvironment() {
+        guard started, !isBusy, !settingsBusy, !monitorInFlight, canMonitor() else { return }
+        guard coreAvailable() else { markCoreMissing(); return }
+        monitorInFlight = true
+        let generation = operationGeneration
+        // 不占用前台操作锁；前台操作开始后丢弃旧采样，避免迟到结果覆盖修复/切换。
+        run(["monitor-status"], timeout: monitorTimeout) { [weak self] result in
+            guard let self = self else { return }
+            self.monitorInFlight = false
+            guard generation == self.operationGeneration, !self.isBusy,
+                  !self.settingsBusy, self.canMonitor() else { return }
+            let lines = result.output.split(separator: "\n").map(String.init)
+            var states: [String: RowState] = [:]
+            var valid = result.succeeded && lines.count == 3 && lines.first == "monitor-version=1"
+            for line in lines.dropFirst() {
+                let pair = line.split(separator: "=", omittingEmptySubsequences: false).map(String.init)
+                guard pair.count == 2, ["代理内核", "TUN网卡"].contains(pair[0]),
+                      states[pair[0]] == nil, ["ok", "fail"].contains(pair[1]) else {
+                    valid = false; continue
+                }
+                states[pair[0]] = pair[1] == "ok" ? .ok : .fail
+            }
+            valid = valid && states.count == 2
+            let keys = [("代理内核", "代理内核"), ("TUN网卡", "TUN 网卡")]
+            if valid && states.values.allSatisfy({ $0 == .ok }) {
+                // 局部健康不等于完整安检通过，恢复后必须重新完成全部审计。
+                if self.monitorNeedsAudit || self.coreMissing || keys.contains(where: { key in
+                    self.rows.contains { $0.name == key.1 && $0.state == .fail }
+                }) {
+                    self.monitorNeedsAudit = false
+                    self.refresh()
+                }
+                return
+            }
+            self.hideAfterSwitch?.cancel()
+            self.monitorNeedsAudit = true
+            for (key, name) in keys {
+                guard let index = self.rows.firstIndex(where: { $0.name == name }) else { continue }
+                self.rows[index].state = valid ? (states[key] ?? .fail) : .fail
+                self.rows[index].detail = valid
+                    ? (states[key] == .ok ? "后台监测：在线" : "后台监测：不在线")
+                    : "后台状态未确认，请重新检查并确认核心脚本为新版"
+            }
+            self.phase = .failed
+            self.lastCheckSummary = "失败"
+            self.banner = valid ? "后台监测发现代理内核或 TUN 离线，恢复后将自动重新检查"
+                : "后台状态读取失败，无法确认代理安全；请重新检查并确认核心脚本为新版"
+        }
     }
 
     func prepareToShow() {
@@ -215,6 +304,7 @@ final class VM: ObservableObject {
             return
         }
         coreMissing = false
+        monitorNeedsAudit = false
         phase = .checking
         lastCheckSummary = "检查中"
         banner = ""
@@ -2586,6 +2676,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
     }
 
     private func configurePreferences() {
+        vm.canMonitor = { [weak self] in
+            guard let self = self else { return false }
+            return !self.guardSettings.isApplying
+        }
+        guardSettings.$isApplying.sink { [weak self] applying in
+            if applying { self?.vm.invalidateMonitorSample() }
+        }.store(in: &subscriptions)
         guardSettings.canStartApplication = { [weak self] in
             guard let self = self else { return false }
             return !self.vm.isBusy && !self.vm.settingsBusy
@@ -2789,6 +2886,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDele
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { hidePanel(); return false }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationWillTerminate(_ notification: Notification) { vm.stopMonitoring() }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         vm.canQuit && !guardSettings.isApplying ? .terminateNow : .terminateCancel
     }

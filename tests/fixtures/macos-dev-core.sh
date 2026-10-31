@@ -29,7 +29,9 @@ def save():
     temporary.replace(state_file)
 
 command = args[0] if args else ""
-if command == "checkdetail" and len(args) == 1:
+if command == "monitor-status" and len(args) == 1:
+    print("monitor-version=1\n代理内核=ok\nTUN网卡=ok")
+elif command == "checkdetail" and len(args) == 1:
     for key in ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6",
                 "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性"):
         status = "skip" if key in state["config"]["disabled"] else "ok"

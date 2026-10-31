@@ -13,6 +13,7 @@ SCENARIOS = (
     "unknown_account", "phase_allowlist", "count_total", "count_range_and_types",
     "timestamp_boundaries", "stale_boundary", "unchecked_and_pending",
     "skipped_is_not_passed", "failure_is_not_passed", "phase_is_historical",
+    "failure_phase_stale", "failure_count_stale", "unchecked_failure",
     "unavailable_is_not_passed",
     "timeline_schedules_expiration", "timeline_expiration_boundary", "timeline_waiting_has_no_past_date",
 )

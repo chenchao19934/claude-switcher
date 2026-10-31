@@ -6,7 +6,7 @@
 python3 -m unittest discover -s tests -v
 ```
 
-57 个菜单栏场景覆盖多账号状态解析、A–D 切换与首次使用提示、旧版状态回退、本地账号刷新、切换前重新审计、警告放行、失败/缺行/重复行/空值/超时/非零退出阻断、忙碌互斥、退出保护、隐藏回调、NSPanel 生命周期、菜单重检、快捷键偏好、后台巡检周期配置、Widget URL 与脱敏摘要。非 macOS 系统跳过这部分，继续运行现有的核心脚本测试。另有 18 个 Widget 模型与时间线场景。
+菜单栏场景覆盖多账号状态解析、A–D 切换与首次使用提示、旧版状态回退、本地账号刷新、切换前重新审计、警告放行、失败/缺行/重复行/空值/超时/非零退出阻断、忙碌互斥、退出保护、隐藏回调、NSPanel 生命周期、菜单重检、快捷键偏好、后台巡检周期配置、自动状态同步、Widget URL 与脱敏摘要。非 macOS 系统跳过这部分，继续运行现有的核心脚本测试。另有 Widget 模型与时间线场景。
 
 ## UI 演示程序
 
@@ -30,6 +30,7 @@ swiftc -O -parse-as-library -D CLAUDE_SWITCHER_TESTS \
 cat > _trash/menu-bar-demo/fake-core.sh <<'SH'
 #!/bin/bash
 case "$1" in
+  monitor-status) printf 'monitor-version=1\n代理内核=ok\nTUN网卡=ok\n' ;;
   checkdetail)
     for key in 代理内核 TUN网卡 出口IP IP一致 时区 地区 IPv6 DNS WebRTC 保镖 规则置顶 客户端语言 ASN属性 生态可达性; do
       if [ "$key" = ASN属性 ]; then echo "$key=warn:演示机房"; else echo "$key=ok:演示数据"; fi
@@ -59,6 +60,9 @@ _trash/menu-bar-demo/MenuBarFixture "$PWD/_trash/menu-bar-demo/fake-core.sh"
 8. 选择「退出 Claude 切换器」后图标消失；确认本机已安装的应用和系统服务没有被修改。
 9. 导出诊断时，系统保存对话框与结果提示不会导致面板意外收起；含跳过的摘要与检查行保持灰色，不计作通过。
 10. 通知中心 Widget 的正式签名、共享容器、系统注册及点击验收按 [MACOS-WIDGET.md](../docs/MACOS-WIDGET.md) 单独执行；编译和模型回归不能替代该项。
+11. 用假核心模拟 TUN 或内核掉线：面板隐藏时菜单栏也应自动显示失败，再次呼出时详情一致；模拟恢复后必须重新完整审计，审计失败不能显示通过。模拟监测超时、无效输出、操作繁忙与唤醒补查，确认没有重叠采样或旧结果覆盖新操作。测试不得关闭真实 TUN 或启动真实 Claude。
+
+App 的轻量采样目标周期固定为 10 秒，不受保镖的 2–10 秒配置影响；它不定时执行完整网络审计。小组件只请求系统刷新，不以菜单栏更新速度作为 WidgetKit 的实时保证。
 
 截图只使用这个演示程序。不要运行真实账号切换或把住宅/代理 IP、凭据放进截图。
 

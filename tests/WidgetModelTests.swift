@@ -175,6 +175,42 @@ struct WidgetModelTests {
                     try expect(stale.headline == "结果已过期" && stale.resultTone == .muted,
                                "主应用退出后不能一直展示旧的进行中阶段")
                 }
+            case "failure_phase_stale", "failure_count_stale":
+                if name == "failure_phase_stale" {
+                    // 账号状态等审计失败可能没有对应的失败检查行。
+                    object["status"] = "failed"
+                    object["failed"] = 0
+                } else {
+                    // 阶段尚未同步时，失败计数也必须独立阻止通过。
+                    object["status"] = "ready"
+                    object["passed"] = 12
+                    object["failed"] = 1
+                }
+                let snapshot = try fixture.required(object)
+                for elapsed in [0.0, 1799.0, 1800.0, 86400.0] {
+                    let entry = StatusWidgetEntry(date: fixture.now.addingTimeInterval(elapsed), snapshot: snapshot, configured: true)
+                    let label = elapsed >= 1800 ? "未通过 · 结果已过期" : "检查未通过"
+                    try expect(entry.headline == label && entry.resultTone == .failure,
+                               "失败必须优先显示，不能被灰色过期提示覆盖")
+                    try expect(entry.snapshot?.checkedAt == fixture.now.timeIntervalSince1970,
+                               "显示失败不能刷新最近完整检查的时间")
+                }
+                let timeline = StatusWidgetProvider.timelineEntries(for: StatusWidgetEntry(date: fixture.now, snapshot: snapshot, configured: true))
+                try expect(timeline.count == 2 && timeline[1].headline == "未通过 · 结果已过期" && timeline[1].resultTone == .failure,
+                           "预先安排的过期时间线也必须保留失败提示")
+            case "unchecked_failure":
+                object["checkedAt"] = 0
+                for phase in ["ready", "failed"] {
+                    object["status"] = phase
+                    for failures in [0, 1] {
+                        object["failed"] = failures
+                        object["passed"] = 13 - failures
+                        let snapshot = try fixture.required(object)
+                        let entry = StatusWidgetEntry(date: fixture.now, snapshot: snapshot, configured: true)
+                        try expect(entry.headline == "尚未检查" && entry.resultTone == .muted,
+                                   "没有完成过检查时，失败字段也不能伪装成已完成的结果")
+                    }
+                }
             case "unavailable_is_not_passed":
                 let unconfigured = StatusWidgetEntry(date: fixture.now, snapshot: nil, configured: false)
                 try expect(unconfigured.headline == "等待配置" && unconfigured.resultTone == .muted,

@@ -73,6 +73,7 @@ private final class Fixture {
         core = root.appendingPathComponent("fake-core.sh")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try write("audit", auditKeys.map { "\($0)=ok" }.joined(separator: "\n") + "\n")
+        try write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=ok\n")
         try write("status", "current=A hasA=1 hasB=0\n")
         try write("switch-output", "OK:已切换到账号 B\n")
         try write("core-script", """
@@ -83,6 +84,7 @@ private final class Fixture {
         result() { if [ -f "$root/$1-exit" ]; then exit "$(cat "$root/$1-exit")"; fi; }
         case "$1" in
           checkdetail) delay check; cat "$root/audit"; result check ;;
+          monitor-status) cat "$root/monitor"; delay monitor; result monitor ;;
           status) cat "$root/status"; result status ;;
           get-client) echo 'client=clash-verge' ;;
           get-check-config) delay get-config; cat "$root/check-config"; result get-config ;;
@@ -106,8 +108,10 @@ private final class Fixture {
         try write("audit", auditKeys.map { "\($0)=\(changes[$0] ?? "ok")" }.joined(separator: "\n") + "\n")
     }
 
-    func vm(checkTimeout: TimeInterval = 2, operationTimeout: TimeInterval = 2) -> VM {
-        VM(core: core.path, checkTimeout: checkTimeout, operationTimeout: operationTimeout)
+    func vm(checkTimeout: TimeInterval = 2, operationTimeout: TimeInterval = 2,
+            monitorInterval: TimeInterval? = nil, monitorTimeout: TimeInterval = 1) -> VM {
+        VM(core: core.path, checkTimeout: checkTimeout, operationTimeout: operationTimeout,
+           monitorInterval: monitorInterval, monitorTimeout: monitorTimeout)
     }
 
     var calls: [String] {
@@ -116,6 +120,11 @@ private final class Fixture {
     }
 
     func idle(_ vm: VM) throws { try spin { !vm.isBusy } }
+
+    func poll(_ vm: VM) throws {
+        vm.pollEnvironment()
+        try spin { !vm.monitorInFlight && !vm.isBusy }
+    }
 
     func deniedSwitch(_ vm: VM) throws {
         vm.switchTo("B")
@@ -567,6 +576,177 @@ struct MenuBarModelTests {
                 try f.idle(vm)
                 try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "手动快捷键收起与重开不能重复或中断修复")
                 delegate.hidePanel()
+            case "monitor_healthy":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try f.poll(vm); try f.poll(vm)
+                try expect(f.calls.filter { $0 == "monitor-status" }.count == 2, "空闲时应完成独立轻量采样")
+                try expect(f.calls.filter { $0 == "checkdetail" }.count == 1, "健康采样不能不断重跑14项网络审计")
+                try expect(vm.phase == .ready && vm.rows.allSatisfy { $0.state == .ok }, "健康采样不得清空完整检查结果")
+            case "monitor_failure_recovery":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=fail\n")
+                try f.poll(vm)
+                try expect(vm.phase == .failed && vm.lastCheckSummary == "失败", "TUN离线必须立即更新为失败")
+                try expect(vm.rows.first { $0.name == "TUN 网卡" }?.state == .fail, "主窗口TUN检查项必须同步失败")
+                try expect(vm.rows.first { $0.name == "出口 IP" }?.state == .ok, "轻量采样不得伪造其他检查结果")
+                try expect(WidgetStatusSnapshot.capture(vm, checkedAt: 42).menuSummary == "未通过", "菜单栏摘要必须与后台失败一致")
+                try expect(f.calls.filter { $0 == "checkdetail" }.count == 1, "离线采样不应阻塞于完整网络审计")
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=ok\n")
+                try f.poll(vm)
+                try expect(f.calls.filter { $0 == "checkdetail" }.count == 2, "恢复后必须自动重新完成14项检查")
+                try expect(vm.phase == .ready && vm.lastCheckSummary == "通过", "恢复且审计通过后应同步主窗口状态")
+            case "monitor_recovery_still_failed":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try f.write("monitor", "monitor-version=1\n代理内核=fail\nTUN网卡=fail\n")
+                try f.poll(vm)
+                try f.audit(["出口IP": "fail:目标国家不一致"])
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=ok\n")
+                try f.poll(vm)
+                try expect(vm.phase == .failed && vm.lastCheckSummary == "失败", "内核与TUN恢复不能覆盖其他硬性安全失败")
+                try expect(vm.rows.first { $0.name == "出口 IP" }?.state == .fail, "恢复审计必须保留出口失败")
+                try f.deniedSwitch(vm)
+            case "monitor_invalid_responses":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                for output in ["", "monitor-version=1\n代理内核=ok\n",
+                               "monitor-version=1\n代理内核=ok\n代理内核=ok\n",
+                               "monitor-version=1\n代理内核=ok\nTUN网卡=warn\n",
+                               "monitor-version=1\n代理内核=ok\nTUN网卡=skip\n",
+                               "monitor-version=2\n代理内核=ok\nTUN网卡=ok\n",
+                               "monitor-version=1\n代理内核=ok\nTUN网卡=ok:在线\n",
+                               "monitor-version=1\n代理内核=ok\nTUN网卡=ok\n额外项=ok\n",
+                               "用法: claude-switch.sh check|checkdetail|status\n"] {
+                    try f.write("monitor", output)
+                    try f.poll(vm)
+                    try expect(vm.phase == .failed && vm.lastCheckSummary == "失败", "无效/旧核心采样输出不得冒充健康")
+                    try expect(vm.rows.prefix(2).allSatisfy { $0.state == .fail }, "采样结果未确认时两个监测项均应拒绝通过")
+                }
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=ok\n")
+                try f.write("monitor-exit", "1")
+                try f.poll(vm)
+                try expect(vm.phase == .failed, "非零退出码即使带全ok输出也必须拒绝")
+                try expect(f.calls.filter { $0 == "checkdetail" }.count == 1, "无效采样不能触发恢复审计")
+            case "monitor_timeout":
+                let vm = f.vm(monitorTimeout: 0.06)
+                vm.start(); try f.idle(vm)
+                try f.write("monitor-delay", "0.3")
+                try f.poll(vm)
+                try expect(vm.phase == .failed && vm.rows.prefix(2).allSatisfy { $0.state == .fail }, "采样超时不得沿用先输出的全ok结果")
+                try expect(!vm.isBusy && !vm.monitorInFlight && vm.canQuit, "超时后必须释放采样状态与前台操作能力")
+            case "monitor_busy_skip":
+                try f.write("check-delay", "0.2")
+                let vm = f.vm()
+                vm.start(); vm.pollEnvironment()
+                try f.idle(vm)
+                try expect(!f.calls.contains("monitor-status"), "启动审计中不能并发采样")
+                try f.write("fix-delay", "0.2")
+                vm.fixAll(); vm.pollEnvironment()
+                try f.idle(vm)
+                try expect(!f.calls.contains("monitor-status"), "前台修复中不能并发采样")
+                try f.write("check-config", #"{"disabled":[],"allowOptionalFailures":false,"logging":true}"#)
+                try f.write("get-config-delay", "0.2")
+                vm.loadCheckConfig(); vm.pollEnvironment()
+                try spin { !vm.settingsBusy }
+                try expect(!f.calls.contains("monitor-status"), "检查设置事务中不能并发采样")
+                try f.poll(vm)
+                try expect(f.calls.filter { $0 == "monitor-status" }.count == 1, "事务结束后采样应恢复")
+            case "monitor_no_overlap":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try f.write("monitor-delay", "0.25")
+                vm.pollEnvironment(); vm.pollEnvironment(); vm.pollEnvironment()
+                try expect(vm.monitorInFlight && !vm.isBusy, "只读采样应独立互斥且不占用前台操作锁")
+                try spin { f.calls.contains("monitor-status") }
+                vm.pollEnvironment()
+                try spin { !vm.monitorInFlight }
+                try expect(f.calls.filter { $0 == "monitor-status" }.count == 1, "较慢采样运行期间不得叠加请求")
+                try f.poll(vm)
+                try expect(f.calls.filter { $0 == "monitor-status" }.count == 2, "完成后才能开始下一轮采样")
+            case "monitor_late_sample":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=fail\n")
+                try f.write("monitor-delay", "0.45")
+                vm.pollEnvironment()
+                try spin { f.calls.contains("monitor-status") }
+                pump(0.04)
+                vm.refresh(); try f.idle(vm)
+                try expect(vm.phase == .ready, "采样运行时前台重检应正常完成")
+                try spin { !vm.monitorInFlight }
+                try expect(vm.phase == .ready && vm.rows.allSatisfy { $0.state == .ok }, "迟到的旧失败不得覆盖前台新审计")
+            case "monitor_hidden_timer_and_stop":
+                let vm = f.vm(monitorInterval: 0.12)
+                let delegate = AppDelegate(vm: vm)
+                delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+                try f.idle(vm)
+                delegate.hidePanel()
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=fail\n")
+                try spin { vm.phase == .failed }
+                try spin { delegate.statusItem?.button?.title.contains("未通过") == true }
+                try expect(delegate.mainWindow?.isVisible == false, "隐窗时后台失败应同步菜单栏且不强制弹窗")
+                vm.stopMonitoring()
+                let stoppedCount = f.calls.filter { $0 == "monitor-status" }.count
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=ok\n")
+                pump(0.4)
+                try expect(f.calls.filter { $0 == "monitor-status" }.count == stoppedCount, "停止监测后不能继续派发定时请求")
+                try expect(vm.phase == .failed, "停止监测后不能隐式更新检查结果")
+            case "monitor_stop_discards_inflight":
+                let vm = f.vm(monitorInterval: 10)
+                vm.start(); try f.idle(vm)
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=fail\n")
+                try f.write("monitor-delay", "0.3")
+                vm.pollEnvironment()
+                try spin { f.calls.contains("monitor-status") }
+                vm.stopMonitoring()
+                try spin { !vm.monitorInFlight }
+                try expect(vm.phase == .ready && vm.rows.allSatisfy { $0.state == .ok }, "停止后已发出的采样回调也必须丢弃")
+            case "monitor_wake":
+                let vm = f.vm(monitorInterval: 10)
+                vm.start(); try f.idle(vm)
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=fail\n")
+                NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+                try spin { vm.phase == .failed }
+                vm.stopMonitoring()
+                try expect(f.calls.filter { $0 == "monitor-status" }.count == 1, "唤醒后应立即补查，无需等待下一次10秒定时")
+                try expect(f.calls.filter { $0 == "checkdetail" }.count == 1, "唤醒轻量检测失败不应重跑完整审计")
+            case "monitor_guard_application":
+                let backend = GuardBackendFixture()
+                backend.writeDelay = 0.2
+                let settings = backend.model()
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm, guardSettings: settings)
+                settings.refresh(); try spin { !settings.isBusy }
+                vm.start(); try f.idle(vm)
+                settings.selectedInterval = 5; settings.apply()
+                vm.pollEnvironment()
+                try expect(settings.isApplying && !vm.monitorInFlight, "管理员应用周期时应跳过采样")
+                try spin { !settings.isBusy }
+                try expect(!f.calls.contains("monitor-status"), "后台配置事务不得派发核心采样")
+                try f.poll(vm)
+                try expect(f.calls.filter { $0 == "monitor-status" }.count == 1, "应用完成后应恢复采样")
+                try expect(delegate.guardSettings === settings, "采样互斥应使用控制器的同一配置模型")
+            case "monitor_guard_late_sample":
+                let backend = GuardBackendFixture()
+                backend.writeDelay = 0.1
+                let settings = backend.model()
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm, guardSettings: settings)
+                settings.refresh(); try spin { !settings.isBusy }
+                vm.start(); try f.idle(vm)
+                try f.write("monitor", "monitor-version=1\n代理内核=ok\nTUN网卡=fail\n")
+                try f.write("monitor-delay", "0.45")
+                vm.pollEnvironment()
+                try spin { f.calls.contains("monitor-status") }
+                settings.selectedInterval = 5; settings.apply()
+                try spin { !settings.isBusy }
+                try expect(settings.current?.verifiedInterval == 5, "后台配置应先完成")
+                try spin { !vm.monitorInFlight }
+                try expect(vm.phase == .ready, "配置事务开始前发出的迟到采样即使事务已结束也必须丢弃")
+                try f.poll(vm)
+                try expect(vm.phase == .failed && delegate.guardSettings === settings, "后续新采样应恢复正常生效")
             case "bodyguard_status_validation":
                 try expect(BodyguardIntervalStatus.decode(guardStatusJSON())?.verifiedInterval == 10, "一致且已注册的调度才可显示已生效")
                 for json in [guardStatusJSON(5, throttle: 10), guardStatusJSON(5, active: 10), guardStatusJSON(5, registered: false), guardStatusJSON(5, unknownRuntime: true)] {

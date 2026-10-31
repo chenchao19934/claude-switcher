@@ -1,6 +1,6 @@
 #!/bin/bash
 # Claude 账号切换器 - 核心脚本 (通用版)
-# 用法: claude-switch.sh check | status | switch A|B|C|D | checkdetail | fix | set-region | update [--check|--auto] | diagnose-proxy
+# 用法: claude-switch.sh check | status | switch A|B|C|D | checkdetail | monitor-status | fix | set-region | update [--check|--auto] | diagnose-proxy
 set -u
 export LC_ALL=en_US.UTF-8
 
@@ -908,7 +908,6 @@ LOG="$HOME/Library/Logs/claude-switch.log"
 CLASH_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 ROUTE_MISSED=""
 KEEP_STAGED=0
-mkdir -p "$BASE/accounts"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >>"$LOG"; }
 
@@ -998,6 +997,21 @@ proxy_alive() {
         *)            pgrep -f verge-mihomo >/dev/null 2>&1 ;;
     esac
 }
+
+# App 常驻状态采样:仅复用本机内核/TUN判定,不执行14项网络审计。
+# 必须在账号目录初始化及客户端日志入口之前退出,不可读取检查设置或写入安装态。
+monitor_status() {
+    echo 'monitor-version=1'
+    if proxy_alive; then echo '代理内核=ok'; else echo '代理内核=fail'; fi
+    if tun_up; then echo 'TUN网卡=ok'; else echo 'TUN网卡=fail'; fi
+}
+if [ "${1:-}" = "monitor-status" ]; then
+    [ "$#" -eq 1 ] || { echo '用法: claude-switch.sh monitor-status' >&2; exit 2; }
+    monitor_status
+    exit 0
+fi
+
+mkdir -p "$BASE/accounts"
 
 # 单文件内嵌 Python 的隔离入口;策略从 WEBRTC_POLICY 或持久化文件读取。
 clash_rules() {
