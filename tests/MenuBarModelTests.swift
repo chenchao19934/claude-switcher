@@ -99,7 +99,7 @@ private final class Fixture {
         esac
         """)
         try FileManager.default.moveItem(at: root.appendingPathComponent("core-script"), to: core)
-        try updateResponse("check", state: "available", message: "发现新版 abcdef123456")
+        try updateResponse("check", state: "available", message: "发现新版 1.1.0")
         try updateResponse("prepare", state: "prepared", message: "更新已准备", token: updateToken)
         try updateResponse("apply", state: "restarting", message: "准备重启切换器")
         try updateResponse("ack", state: "updated", message: "已更新并确认启动")
@@ -126,8 +126,9 @@ private final class Fixture {
     }
 
     func updateResponse(_ command: String, state: String, message: String,
-                        token: String? = nil, exit: Int = 0) throws {
-        var reply = ["state": state, "version": "abcdef123456", "message": message]
+                        token: String? = nil, exit: Int = 0, version: String? = "1.1.0") throws {
+        var reply = ["state": state, "message": message]
+        if let version = version { reply["version"] = version }
         if let token = token { reply["token"] = token }
         let data = try JSONSerialization.data(withJSONObject: reply, options: [.sortedKeys])
         try write("update-\(command)-output", String(decoding: data, as: UTF8.self))
@@ -135,11 +136,13 @@ private final class Fixture {
     }
 
     func vm(checkTimeout: TimeInterval = 2, operationTimeout: TimeInterval = 2,
-            monitorInterval: TimeInterval? = nil, monitorTimeout: TimeInterval = 1) -> VM {
+            monitorInterval: TimeInterval? = nil, monitorTimeout: TimeInterval = 1,
+            installedVersion: String? = "1.0") -> VM {
         VM(core: core.path, checkTimeout: checkTimeout, operationTimeout: operationTimeout,
            monitorInterval: monitorInterval, monitorTimeout: monitorTimeout,
            updateCommand: ["/bin/bash", updater.path],
-           applicationPath: root.appendingPathComponent("Demo Switcher.app").path)
+           applicationPath: root.appendingPathComponent("Demo Switcher.app").path,
+           installedVersion: installedVersion)
     }
 
     var calls: [String] {
@@ -614,17 +617,65 @@ struct MenuBarModelTests {
                 try f.idle(vm)
                 try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "手动快捷键收起与重开不能重复或中断修复")
                 delegate.hidePanel()
+            case "update_installed_version":
+                let vm = f.vm(installedVersion: "1.0")
+                try expect(vm.installedVersion == "1.0" && vm.latestReleaseVersionLabel == "未检查", "旧App版本必须如实显示，远端尚未请求不能假设最新版")
+                for version in [nil, "", " \n "] as [String?] {
+                    try expect(f.vm(installedVersion: version).installedVersion == "未知", "缺失或空版本信息必须显示未知，不能硬写新版本")
+                }
+                try expect(f.vm(installedVersion: "0.9.2").installedVersion == "0.9.2", "当前版本必须来自安装包元数据")
+                try expect(f.calls.isEmpty && f.updateCalls.isEmpty, "读取显示版本不能更新或探测安装态")
+            case "update_version_fetching_and_failure":
+                let vm = f.vm(installedVersion: "1.0")
+                try f.checkedUpdate(vm)
+                try expect(vm.latestReleaseVersionLabel == "1.1.0", "成功查询应显示正式版本号")
+                try f.write("update-check-delay", "0.2")
+                try f.updateResponse("check", state: "error", message: "GitHub 连接失败", exit: 1, version: nil)
+                vm.checkUpdate()
+                try expect(vm.checkingUpdate && vm.latestReleaseVersionLabel == "正在获取…" && vm.updateVersion.isEmpty, "新请求必须立即清除上次远端版本，不能沿用旧结果")
+                try expect(vm.installedVersion == "1.0", "获取远端版本期间当前版本必须保持不变")
+                try spin { !vm.checkingUpdate }
+                try expect(vm.latestReleaseVersionLabel == "获取失败" && vm.updateVersion.isEmpty && !vm.updateAvailable, "网络失败不能把旧远端版本显示为最新")
+                try expect(vm.installedVersion == "1.0" && vm.updateText == "GitHub 连接失败", "失败不能改变当前版本或隐藏下载错误")
+                try f.updateResponse("check", state: "available", message: "发现新版 1.2.0", version: "1.2.0")
+                try f.checkedUpdate(vm)
+                try expect(vm.latestReleaseVersionLabel == "1.2.0" && vm.updateVersion == "1.2.0", "重试成功后应采用本次查询版本")
+                try expect(f.updateCalls == ["check", "check", "check"] && f.calls.isEmpty, "版本查询始终只能检查元数据，不能准备或安装")
+            case "update_release_unavailable":
+                let vm = f.vm()
+                try f.checkedUpdate(vm)
+                try f.updateResponse("check", state: "unavailable", message: "GitHub 尚无正式发布版本", version: nil)
+                try f.checkedUpdate(vm)
+                try expect(vm.latestReleaseVersionLabel == "暂无正式发布" && vm.updateVersion.isEmpty, "无Release属于已确认的空状态，不能展示旧版本或当作网络失败")
+                try expect(!vm.updateAvailable && !vm.canInstallUpdate && vm.installedVersion == "1.0", "没有正式发布时不能允许更新，也不能改当前版本")
+                vm.installUpdate(confirmed: true)
+                try expect(f.updateCalls == ["check", "check"] && f.calls.isEmpty, "无正式发布时不得启动准备或安装事务")
+            case "update_remote_version_validation":
+                let vm = f.vm()
+                for version in [nil, "", "v1.1.0", "1.0", "abcdef123456", "1.1.0-beta", "1.1.0+build", "01.1.0", "1.01.0", "1.1.00", "1.1.0\n", " 1.1.0", "1.1.0.1"] as [String?] {
+                    try f.updateResponse("check", state: "available", message: "格式无效的版本", version: version)
+                    try f.checkedUpdate(vm)
+                    try expect(vm.latestReleaseVersionLabel == "获取失败" && vm.updateVersion.isEmpty && !vm.canInstallUpdate, "只接受无前缀三段数字正式版本，错误版本不得显示或用于安装")
+                    try expect(vm.installedVersion == "1.0", "远端版本无效不能影响当前版本")
+                }
+                for version in ["0.0.0", "1.1.0", "12.34.56"] {
+                    try f.updateResponse("check", state: "available", message: "正式版本", version: version)
+                    try f.checkedUpdate(vm)
+                    try expect(vm.latestReleaseVersionLabel == version && vm.updateVersion == version, "有效标准正式版本应被显示")
+                }
+                try expect(f.updateCalls.allSatisfy { $0 == "check" } && f.calls.isEmpty, "版本格式验证不得执行安装")
             case "update_check_readonly":
                 let vm = f.vm()
                 try f.checkedUpdate(vm)
                 try expect(f.updateCalls == ["check"] && f.calls.isEmpty, "版本检查不得隐式准备、安装或执行核心更新")
-                try expect(vm.updateAvailable && vm.canInstallUpdate && vm.updateVersion == "abcdef123456", "有效新版应允许用户主动确认更新")
-                try expect(vm.updateText == "发现新版 abcdef123456" && !vm.isBusy && vm.canQuit, "只读检查完成后应显示结果且保留前台操作能力")
+                try expect(vm.updateAvailable && vm.canInstallUpdate && vm.updateVersion == "1.1.0", "有效新版应允许用户主动确认更新")
+                try expect(vm.updateText == "发现新版 1.1.0" && !vm.isBusy && vm.canQuit, "只读检查完成后应显示结果且保留前台操作能力")
+                try expect(vm.installedVersion == "1.0" && vm.latestReleaseVersionLabel == "1.1.0", "当前App版本和GitHub最新版本必须分开显示")
                 let arguments = try String(contentsOf: f.root.appendingPathComponent("update-arguments"), encoding: .utf8)
                 try expect(arguments.contains("--app\n\(f.root.appendingPathComponent("Demo Switcher.app").path)\n--core\n\(f.core.path)\n"), "更新器应以独立参数收到含空格的App路径和明确的假核心路径")
             case "update_check_current":
                 try f.updateResponse("check", state: "current", message: "已经是最新版本")
-                let vm = f.vm()
+                let vm = f.vm(installedVersion: "1.1.0")
                 try f.checkedUpdate(vm)
                 vm.installUpdate(confirmed: true)
                 try expect(!vm.updateAvailable && !vm.canInstallUpdate && f.updateCalls == ["check"], "无可用新版时不得执行更新")
@@ -761,12 +812,13 @@ struct MenuBarModelTests {
                 try expect(vm.phase == .ready && vm.rows.allSatisfy { $0.state == .ok }, "迟到的旧监测结果不能覆盖桌面更新事务")
                 try expect(vm.updateText == "模拟准备失败" && vm.canQuit, "采样不能覆盖更新失败结果或退出状态")
             case "update_acknowledge":
-                let vm = f.vm()
+                let vm = f.vm(installedVersion: "1.1.0")
                 vm.acknowledgeUpdate(token: "invalid")
                 try expect(f.updateCalls.isEmpty, "非法启动凭据不能调用更新组件")
                 vm.acknowledgeUpdate(token: updateToken)
                 try spin { vm.showUpdateSheet }
-                try expect(f.updateCalls == ["ack"] && vm.updateVersion == "abcdef123456" && vm.updateText == "已更新并确认启动", "新App应确认一次性更新事务并显示结果")
+                try expect(f.updateCalls == ["ack"] && vm.installedVersion == "1.1.0" && vm.updateText == "已更新并确认启动", "新App应确认一次性更新事务并显示实际安装版本")
+                try expect(vm.updateVersion.isEmpty && vm.latestReleaseVersionLabel == "未检查", "启动握手不能冒充GitHub最新版本查询")
                 try expect(!vm.updateAvailable && !vm.installingUpdate, "启动握手不能自动开启下一轮更新")
             case "update_missing_component":
                 let vm = VM(core: f.core.path, monitorInterval: nil, updateCommand: [])

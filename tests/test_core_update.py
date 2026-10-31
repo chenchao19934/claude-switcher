@@ -12,7 +12,9 @@ import unittest
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-REVISION = "a" * 40
+VERSION = "1.2.3"
+TAG = "v" + VERSION
+REPOSITORY = "chenchao19934/claude-switcher"
 KEYS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
         "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性")
 CONFIG = ('PROXY_MODE="clash-verge"\nPROXY_GROUP="IpEqual"\nCOUNTRY_TARGET="US"\n'
@@ -51,10 +53,10 @@ if os.environ.get("UPDATE_DELAY"):
     time.sleep(float(os.environ["UPDATE_DELAY"]))
 code = int(os.environ.get("UPDATE_CURL_RC", "0"))
 if code:
-    print("503", end="")
+    print(os.environ.get("UPDATE_ERROR_STATUS", "503"), end="")
     print("synthetic private proxy details", file=sys.stderr)
     sys.exit(code)
-name = "revision.json" if url.endswith("/commits/main") else ("SHA256SUMS" if url.endswith("/SHA256SUMS") else "source.zip")
+name = "release.json" if url.endswith("/releases/latest") else ("SHA256SUMS-release.txt" if url.endswith("/SHA256SUMS-release.txt") else "source.zip")
 shutil.copyfile(root / name, args[args.index("--output") + 1])
 print(os.environ.get("UPDATE_HTTP_STATUS", "200"), end="")
 ''')
@@ -64,7 +66,7 @@ root = Path(os.environ["UPDATE_FIXTURE"])
 (root / "scutil-called").write_text("called")
 print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort : 19191\\n}")
 ''')
-        (self.root / "revision.json").write_text(json.dumps({"sha": REVISION}))
+        self.stub("uname", 'import os\nprint(os.environ.get("UPDATE_ARCH", "' + os.uname().machine + '"))\n')
         self.package()
 
     def stub(self, name, script):
@@ -72,14 +74,17 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
         path.write_text("#!" + sys.executable + " -B\n" + script)
         path.chmod(0o755)
 
-    def package(self, audit=None, exit_code=0, manifest_changes=None, extra_zip=None, core=None):
+    def package(self, audit=None, exit_code=0, manifest_changes=None, extra_zip=None, core=None, version_value=VERSION):
         if audit is None:
             audit = "\n".join(key + "=ok" for key in KEYS)
         remote_core = ("#!/bin/bash\n" + CONFIG + "if [ \"${1:-}\" = checkdetail ]; then\n"
                        + "cat <<'AUDIT'\n" + audit + "\nAUDIT\nexit " + str(exit_code)
                        + "\nfi\nexit 2\n").encode()
         self.artifacts = {"core/claude-switch.sh": core if core is not None else remote_core,
-                          "core/stun-probe.py": b"# new stun\n", "core/desktop-update.py": b"# new helper\n"}
+                          "core/stun-probe.py": b"# new stun\n", "core/desktop-update.py": b"# new helper\n",
+                          "daemons/claude-bodyguard.sh": b"# guard __HOME__ __PROXY_MODE__\n",
+                          "daemons/tz-watchdog.sh": b"# watchdog __HOME__ __TZ_TARGET__\n",
+                          "daemons/bodyguard-settings.py": b"# settings\n"}
         manifest = {name: hashlib.sha256(value).hexdigest() for name, value in self.artifacts.items()}
         if manifest_changes:
             manifest_changes(manifest)
@@ -87,9 +92,21 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
         (self.root / "SHA256SUMS").write_text(text)
         with zipfile.ZipFile(self.root / "source.zip", "w") as archive:
             for name, value in self.artifacts.items():
-                archive.writestr("claude-switcher-" + REVISION + "/" + name, value)
+                archive.writestr(name, value)
+            archive.writestr("SHA256SUMS", text)
+            archive.writestr("VERSION", version_value + "\n")
+            archive.writestr("Claude切换器.app/Contents/MacOS/ClaudeSwitcher", b"precompiled fixture")
             if extra_zip:
                 extra_zip(archive)
+        self.archive_name = "ClaudeSwitcher-" + VERSION + "-macos-" + self.env.get("UPDATE_ARCH", os.uname().machine) + "-update.zip"
+        self.external_manifest()
+        assets = [{"name": name, "browser_download_url": "https://github.com/" + REPOSITORY + "/releases/download/" + TAG + "/" + name}
+                  for name in (self.archive_name, "SHA256SUMS-release.txt")]
+        (self.root / "release.json").write_text(json.dumps({"tag_name": TAG, "draft": False, "prerelease": False, "assets": assets}))
+
+    def external_manifest(self):
+        checksum = hashlib.sha256((self.root / "source.zip").read_bytes()).hexdigest()
+        (self.root / "SHA256SUMS-release.txt").write_text(checksum + "  " + self.archive_name + "\n")
 
     def snapshot(self):
         return {str(path.relative_to(self.home)): (stat.S_IMODE(path.stat().st_mode), path.stat().st_mtime_ns,
@@ -105,7 +122,7 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
         for name in ("stun-probe.py", "desktop-update.py"):
             (self.base / name).write_bytes(("# old " + name + "\n").encode())
 
-    def test_check_is_read_only_and_uses_one_revision(self):
+    def test_check_is_read_only_and_uses_only_exact_formal_release_assets(self):
         for arguments in (("update-check",), ("update", "--check")):
             with self.subTest(arguments=arguments):
                 before = self.snapshot()
@@ -120,9 +137,11 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
             self.assertIn("chenchao19934/claude-switcher", call["url"])
             self.assertIn("-fLsS", call["args"])
             self.assertIn("--retry", call["args"])
-            if not call["url"].endswith("/commits/main"):
-                self.assertIn("/" + REVISION, call["url"])
-                self.assertNotIn("/main", call["url"])
+            if not call["url"].endswith("/releases/latest"):
+                self.assertIn("/releases/download/" + TAG + "/", call["url"])
+            self.assertNotIn("/main", call["url"])
+            self.assertNotIn("codeload", call["url"])
+            self.assertNotIn("raw.githubusercontent", call["url"])
 
     def test_system_proxy_fallback_is_used_without_logging_details(self):
         result = self.run_update("update-check")
@@ -172,13 +191,16 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
             self.assertNotIn("private proxy", result.stdout + result.stderr)
             self.assertEqual(before, self.snapshot())
 
-    def test_invalid_revision_and_archive_are_rejected(self):
-        (self.root / "revision.json").write_text('{"sha":"main"}')
+    def test_invalid_release_tag_and_archive_are_rejected(self):
+        metadata = json.loads((self.root / "release.json").read_text())
+        metadata["tag_name"] = "main"
+        (self.root / "release.json").write_text(json.dumps(metadata))
         result = self.run_update("update-check")
-        self.assertIn("有效提交", result.stdout)
+        self.assertIn("标签", result.stdout)
         self.assertNotEqual(result.returncode, 0)
-        (self.root / "revision.json").write_text(json.dumps({"sha": REVISION}))
+        self.package()
         (self.root / "source.zip").write_bytes(b"not-a-zip")
+        self.external_manifest()
         result = self.run_update("update-check")
         self.assertIn("解压失败", result.stdout)
         self.assertNotEqual(result.returncode, 0)
@@ -195,21 +217,21 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
         for text, message in (("/escape", "不安全路径"), ("../escape", "不安全路径"),
                               ("core/../escape", "不安全路径")):
             self.package()
-            with (self.root / "SHA256SUMS").open("a") as handle:
+            with (self.root / "SHA256SUMS-release.txt").open("a") as handle:
                 handle.write("0" * 64 + "  " + text + "\n")
             result = self.run_update("update-check")
             self.assertIn(message, result.stdout)
             self.assertNotEqual(result.returncode, 0)
         self.package()
-        with (self.root / "SHA256SUMS").open("a") as handle:
-            handle.write((self.root / "SHA256SUMS").read_text().splitlines()[0] + "\n")
+        with (self.root / "SHA256SUMS-release.txt").open("a") as handle:
+            handle.write((self.root / "SHA256SUMS-release.txt").read_text().splitlines()[0] + "\n")
         self.assertIn("重复项", self.run_update("update-check").stdout)
         self.package(manifest_changes=lambda manifest: manifest.__setitem__("core/stun-probe.py", "0" * 64))
         self.assertIn("SHA256", self.run_update("update-check").stdout)
 
     def test_archive_rejects_traversal_and_symlinks(self):
         def symlink(archive):
-            info = zipfile.ZipInfo("claude-switcher-" + REVISION + "/linked")
+            info = zipfile.ZipInfo("core/linked")
             info.create_system = 3
             info.external_attr = (stat.S_IFLNK | 0o777) << 16
             archive.writestr(info, "../escape")
@@ -304,7 +326,7 @@ print("<dictionary> {\\n  HTTPEnable : 1\\n  HTTPProxy : 127.0.0.1\\n  HTTPPort 
         before = self.snapshot()
         result = self.run_update("update-check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("已是最新", result.stdout)
+        self.assertIn("已与正式 Release", result.stdout)
         self.assertEqual(before, self.snapshot())
 
     def test_interrupted_update_releases_its_own_lock(self):
@@ -385,6 +407,64 @@ exec(compile(source, '<isolated updater>', 'exec'))
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.base / ".update.lock").exists())
         self.assertEqual(self.core.read_bytes(), self.original)
+
+    def test_release_404_reports_unpublished_without_source_fallback(self):
+        self.env.update(UPDATE_CURL_RC="22", UPDATE_ERROR_STATUS="404")
+        before = self.snapshot()
+        result = self.run_update("update-check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("仓库尚无正式发布版本", result.stdout)
+        self.assertEqual(before, self.snapshot())
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["url"].endswith("/releases/latest"))
+
+    def test_draft_prerelease_and_wrong_asset_urls_are_rejected(self):
+        for change in (lambda release: release.update(draft=True),
+                       lambda release: release.update(prerelease=True),
+                       lambda release: release["assets"][0].update(browser_download_url="https://example.invalid/untrusted.zip"),
+                       lambda release: release["assets"][0].update(browser_download_url=release["assets"][0]["browser_download_url"].replace("https:", "http:")),
+                       lambda release: release["assets"].append(release["assets"][0])):
+            self.package()
+            release = json.loads((self.root / "release.json").read_text())
+            change(release)
+            (self.root / "release.json").write_text(json.dumps(release))
+            before = self.snapshot()
+            result = self.run_update("update-check")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(before, self.snapshot())
+
+    def test_release_assets_match_both_supported_architectures(self):
+        for arch in ("arm64", "x86_64"):
+            self.env["UPDATE_ARCH"] = arch
+            self.package()
+            self.calls.unlink(missing_ok=True)
+            result = self.run_update("update-check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+            self.assertTrue(any(call["url"].endswith("macos-" + arch + "-update.zip") for call in calls))
+
+    def test_missing_release_asset_and_version_mismatch_are_rejected(self):
+        release = json.loads((self.root / "release.json").read_text())
+        release["assets"] = release["assets"][1:]
+        (self.root / "release.json").write_text(json.dumps(release))
+        self.assertIn("缺少当前架构", self.run_update("update-check").stdout)
+        self.package(version_value="9.9.9")
+        self.assertIn("VERSION", self.run_update("update-check").stdout)
+
+    def test_outer_zip_sha_is_required_before_extraction(self):
+        (self.root / "SHA256SUMS-release.txt").write_text("0" * 64 + "  " + self.archive_name + "\n")
+        result = self.run_update("update-check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("正式更新包 SHA256", result.stdout)
+        (self.root / "SHA256SUMS-release.txt").write_text("0" * 64 + "  unrelated.zip\n")
+        self.assertIn("缺少必需工件", self.run_update("update-check").stdout)
+
+    def test_internal_manifest_has_exact_six_artifacts(self):
+        self.package(manifest_changes=lambda manifest: manifest.__setitem__("extra.py", "0" * 64))
+        result = self.run_update("update-check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("非预期项", result.stdout)
 
     def test_missing_helpers_roll_back_to_absence(self):
         self.package(audit="")

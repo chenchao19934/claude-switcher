@@ -32,6 +32,8 @@ private struct DesktopUpdateReply: Decodable {
     let token: String?
 }
 
+private enum LatestVersionState { case unchecked, fetching, known, unavailable, failed }
+
 struct AccountStamp: Equatable {
     let size: String
     let date: String
@@ -90,6 +92,7 @@ final class VM: ObservableObject {
     @Published private(set) var installingUpdate = false
     @Published private(set) var updateAvailable = false
     @Published private(set) var updateVersion = ""
+    @Published private var latestVersionState: LatestVersionState = .unchecked
     @Published var showUpdateSheet = false
     @Published private(set) var coreMissing = false
     @Published private(set) var currentClient = ""
@@ -120,6 +123,7 @@ final class VM: ObservableObject {
     ]
 
     let core: String
+    let installedVersion: String
     private let checkTimeout: TimeInterval
     private let operationTimeout: TimeInterval
     private let monitorInterval: TimeInterval?
@@ -142,8 +146,11 @@ final class VM: ObservableObject {
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
          checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180,
          monitorInterval: TimeInterval? = 10, monitorTimeout: TimeInterval = 3,
-         updateCommand: [String]? = nil, applicationPath: String = Bundle.main.bundlePath) {
+         updateCommand: [String]? = nil, applicationPath: String = Bundle.main.bundlePath,
+         installedVersion: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) {
         self.core = core
+        let version = installedVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.installedVersion = version.isEmpty ? "未知" : version
         self.checkTimeout = checkTimeout
         self.operationTimeout = operationTimeout
         self.monitorInterval = monitorInterval
@@ -581,14 +588,46 @@ final class VM: ObservableObject {
         checkingUpdate = true
         updateAvailable = false
         updateVersion = ""
+        latestVersionState = .fetching
         updateText = "正在检查更新…"
         runUpdate(["check"], timeout: 240) { result in
             self.checkingUpdate = false
-            guard let reply = self.updateReply(result, allowed: ["available", "current"]) else { return }
+            guard let reply = self.updateReply(result, allowed: ["available", "current", "unavailable"]) else {
+                self.latestVersionState = .failed
+                return
+            }
+            if reply.state == "unavailable" {
+                self.latestVersionState = .unavailable
+                self.updateText = reply.message
+                return
+            }
+            guard let version = reply.version, Self.isReleaseVersion(version) else {
+                self.latestVersionState = .failed
+                self.updateText = "GitHub 返回的正式版本号无效，请重试"
+                return
+            }
             self.updateAvailable = reply.state == "available"
-            self.updateVersion = reply.version ?? ""
+            self.updateVersion = version
+            self.latestVersionState = .known
             self.updateText = reply.message
         }
+    }
+
+    var latestReleaseVersionLabel: String {
+        switch latestVersionState {
+        case .unchecked: return "未检查"
+        case .fetching: return "正在获取…"
+        case .known: return updateVersion
+        case .unavailable: return "暂无正式发布"
+        case .failed: return "获取失败"
+        }
+    }
+
+    private static func isReleaseVersion(_ version: String) -> Bool {
+        guard version.count <= 64,
+              let range = version.range(of: "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+                                        options: .regularExpression) else { return false }
+        return range == version.startIndex..<version.endIndex
     }
 
     var canInstallUpdate: Bool {
@@ -611,7 +650,7 @@ final class VM: ObservableObject {
         installingUpdate = true
         isBusy = true
         updateRestartRequested = false
-        updateText = "正在下载、校验并准备更新…\n编译 App 和安全检查可能需要几分钟，请保持切换器运行。"
+        updateText = "正在下载并校验正式版本…\n完整安全检查可能需要几分钟，请保持切换器运行。"
         runUpdate(["prepare"], timeout: 600) { result in
             guard let reply = self.updateReply(result, allowed: ["prepared", "current"]) else {
                 self.finishUpdateFailure(); return
@@ -645,7 +684,6 @@ final class VM: ObservableObject {
             guard let reply = self.updateReply(result, allowed: ["updated"]) else {
                 self.showUpdateSheet = true; return
             }
-            self.updateVersion = reply.version ?? ""
             self.updateAvailable = false
             self.updateText = reply.message
             self.showUpdateSheet = true
@@ -691,7 +729,7 @@ final class VM: ObservableObject {
         return """
         这是「Claude 切换器」的 AI 交接提示词。请先完整阅读交接文档，再开始安装、配置或排障。
 
-        仓库地址：https://github.com/YOURSJEYO/claude-switcher
+        仓库地址：https://github.com/chenchao19934/claude-switcher
         \(agentsLine)
 
         执行要求：
@@ -1143,7 +1181,7 @@ struct ContentView: View {
             Text("还差一步：安装核心脚本").font(.callout.bold()).foregroundColor(ClaudeTheme.ink)
             Text(vm.banner).font(.caption).foregroundColor(ClaudeTheme.muted).multilineTextAlignment(.center)
             HStack(spacing: 10) {
-                Button { openURL("https://github.com/YOURSJEYO/claude-switcher/releases/latest") } label: {
+                Button { openURL("https://github.com/chenchao19934/claude-switcher/releases/latest") } label: {
                     Label("打开下载页", systemImage: "arrow.down.circle")
                         .font(.callout.bold())
                         .padding(.horizontal, 18).padding(.vertical, 8)
@@ -1152,7 +1190,7 @@ struct ContentView: View {
                         .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                Button { openURL("https://github.com/YOURSJEYO/claude-switcher#安装") } label: {
+                Button { openURL("https://github.com/chenchao19934/claude-switcher#安装") } label: {
                     Label("安装说明", systemImage: "book")
                         .font(.callout.bold())
                         .padding(.horizontal, 18).padding(.vertical, 8)
@@ -1365,10 +1403,27 @@ struct UpdateControls: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if !vm.updateVersion.isEmpty {
-                Text("版本标识：\(vm.updateVersion)")
-                    .font(.caption.monospaced()).foregroundColor(ClaudeTheme.muted)
+            HStack(alignment: .top, spacing: 18) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("当前版本").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    Text(vm.installedVersion)
+                        .font(.system(.callout, design: .monospaced).weight(.medium))
+                        .foregroundColor(ClaudeTheme.ink)
+                        .textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("GitHub 最新正式版本").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    Text(vm.latestReleaseVersionLabel)
+                        .font(.system(.callout, design: .monospaced).weight(.medium))
+                        .foregroundColor(vm.updateVersion.isEmpty ? ClaudeTheme.muted : ClaudeTheme.ink)
+                        .textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .padding(12)
+            .background(ClaudeTheme.iconWell)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
             HStack(spacing: 12) {
                 Button(vm.checkingUpdate ? "正在检查…" : "重新检查") { vm.checkUpdate() }
                     .disabled(vm.checkingUpdate || vm.isBusy || vm.settingsBusy)
@@ -1380,7 +1435,7 @@ struct UpdateControls: View {
             }
             Text("更新 App、核心脚本与检测探针；保留账号和配置。下载会使用系统代理，校验或安全检查失败会中止，替换或启动失败自动回滚。")
                 .font(.caption).foregroundColor(ClaudeTheme.muted)
-            Text("需要已安装的 Xcode 命令行工具；系统守护组件的升级会另行提示。")
+            Text("从正式发布版本下载更新，无需本机编译；系统守护组件的升级会另行提示。")
                 .font(.caption2).foregroundColor(ClaudeTheme.muted)
         }
     }
@@ -1424,7 +1479,7 @@ struct UpdateSheet: View {
             }
             .padding(20)
         }
-        .frame(width: 540, height: 350)
+        .frame(width: 540, height: 420)
         .preferredColorScheme(.light)
     }
 
@@ -2120,7 +2175,7 @@ struct QuickPanelView: View {
         HStack {
             Text("安装核心后即可执行检查与账号切换").font(.system(size: 12)).foregroundColor(ClaudeTheme.muted)
             Spacer()
-            Link("安装说明 ↗", destination: URL(string: "https://github.com/YOURSJEYO/claude-switcher#安装")!)
+            Link("安装说明 ↗", destination: URL(string: "https://github.com/chenchao19934/claude-switcher#安装")!)
                 .font(.system(size: 12)).foregroundColor(ClaudeTheme.terracottaDeep)
         }
     }

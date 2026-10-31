@@ -28,7 +28,7 @@
 3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名写进 `PROXY_GROUP="..."`（其他客户端跳过）
 4. 按出口 IP 自动锁定地区目标：多源依次尝试 ipinfo.io（country/timezone）→ ipapi.co（country_code/timezone）→ ifconfig.co（country_iso/timezone）→ Cloudflare trace（loc，时区用国家默认映射），全失败时让用户在 US/JP/TW/HK/SG/GB/DE/FR/KR/AU/CA 中手动选，`FORCE=1` 按 US + America/New_York；country → `COUNTRY_TARGET`，timezone → `TZ_TARGET`，country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ `LOCALE_TARGET`，三项都写进脚本头部
 5. 参照 `daemons/` 目录的模板，物化保镖与时区看门狗脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` 替换为实际值），并复制 `daemons/bodyguard-settings.py`，用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher/`（目录和三个文件均 chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon 安装到 `/Library/LaunchDaemons/`（plist 的 ProgramArguments 已写死指向系统目录，直接 cp 即可）。保镖默认 `StartInterval=ThrottleInterval=10`；面板仅允许管理员授权收紧到 2–10 秒，不提供关闭或延长，不改变检测与终止条件。调用配置组件固定使用 `/usr/bin/python3 -I -B`，不得提权执行用户目录／仓库副本；旧安装缺组件需重跑安装器，普通 update 不会部署它。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto`）
-6. 现场编译界面 App（需要 Xcode 命令行工具，必须带 `-target` 否则新 SDK 产物在老系统拒启动）：
+6. 首次安装／源码安装时现场编译界面 App（需要 Xcode 命令行工具，必须带 `-target` 否则新 SDK 产物在老系统拒启动；日常正式 Release 更新使用 CI 预编译包，不需要这些编译工具）：
    ```bash
    swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o Claude切换器.app/Contents/MacOS/ClaudeSwitcher -framework SwiftUI -framework AppKit
    ```
@@ -37,10 +37,12 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行比对去重 → 备份 .bak → 注入配置 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
+日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：读取本维护仓库正式 `releases/latest` → 下载同版本、同架构 `update.zip` 和 `SHA256SUMS-release.txt` → 校验外层 ZIP SHA256、VERSION 与内部核心三工件／守护三模板清单 → 剔除 5 个配置行比对核心与配套脚本 → 备份各工件 `.bak` → 按字面赋值行保留配置并替换核心／STUN／用户态更新组件 → 完整审计，要求 14 项唯一、合法且硬项全 ok，任何缺行、非零退出或安全失败均回滚全部工件。只读检查不创建账号目录、日志或更新锁；没有正式发布时只提示，不回退 main。终端更新不改变 GUI 版本或部署 root 守护）
 
 
-macOS 界面更新：新版「版本更新」页使用 App 内置的 `core/desktop-update.py`（安装／打包时复制到 `Contents/Resources/desktop-update.py`），先只读检查，再由用户确认准备、完整审计、备份替换 App／核心／STUN 和重启握手；失败回滚全部。更新源固定为当前维护仓库 `chenchao19934/claude-switcher` 的 main，源码与清单固定到同一提交，下载沿用环境代理或 macOS 系统代理。终端 `update` 仍不换 GUI，但会同步核心、STUN 与用户态桌面更新组件；任何缺行、硬项非 ok、非零退出都会回滚。两条更新路径共用 `~/.claude-switcher/.update.lock`，不清未知锁；拒绝 root 实际更新，不部署系统守护。旧 GUI 需先替换一次；正式签名／Widget 版本不可用源码 ad-hoc 更新降级。详见 `docs/MACOS-UPDATES.md`。
+macOS 界面更新：新版「版本更新」页使用 App 内置的 `core/desktop-update.py`（安装／打包时复制到 `Contents/Resources/desktop-update.py`），先只读检查，再由用户确认准备、完整审计、备份替换 App／核心／STUN，替换后复审并完成重启握手；失败回滚全部。客户端只读取当前维护仓库 `chenchao19934/claude-switcher` 的正式 `releases/latest`（非草稿、非预发布，标签 `v主版本.次版本.修订版本`），按本机 arm64／x86_64 下载同版本预编译 ZIP 与外部 SHA256 清单，验证包、版本、架构、App 签名及内部核心／守护工件。用户更新无需本机编译或 Xcode 命令行工具，Python 3 仍需可用；不得回退到 main；仅界面变化也须递增正式语义版本。两条更新路径共用 `~/.claude-switcher/.update.lock`，不清未知锁；拒绝 root 实际更新，守护模板只比对并提示。旧 GUI 需先替换一次新版引导 App，之后可在页面更新；正式签名／Widget 版本需用相同签名的专用渠道。账号、设置、代理和 root 服务不参与替换。暂存／worker／握手与回滚边界见 `docs/MACOS-UPDATES.md`。
+
+macOS 正式发布流程：维护者确定新的三段语义版本后，经当次明确授权才创建并推送 `v1.2.3` 这类标签；GitHub Actions 复用检查门，在同一标签上运行适用测试，再完成 arm64／x86_64 双架构编译打包、统一 `SHA256SUMS-release.txt`，最后一次性创建 Release。不得覆盖已有 Release；仅 GUI 变化也应递增版本。Fork 的 Actions 可能需要维护者在 GitHub 页面启用。未实际运行成功前，不得声称首个正式 Release 已发布或真实安装态更新已验收。普通修复的提交推送授权不包含打标签或发布；本机安装／更新仍遵守文末当次授权纪律。
 
 检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 6 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
@@ -86,7 +88,7 @@ macOS 界面更新：新版「版本更新」页使用 App 内置的 `core/deskt
 2. 切换账号前必须先完全退出 Claude 进程，再交换数据目录
 3. 不要在日志、文档、Issue 里暴露用户的住宅/代理 IP 与任何凭据
 4. 不要改动 `~/.claude-switcher/accounts/` 下的存档结构
-5. **维护纪律**：`core/`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——自动更新靠它校验工件完整性，清单与代码不一致会导致所有用户更新失败
+5. **维护纪律**：`core/`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——CI 打包前校验该清单；正式更新包另带核心／守护工件内部清单，Release 统一清单校验整个 ZIP，任一不一致均应中止
 6. **守护进程脚本只在 root 目录**：`/Library/Application Support/claude-switcher/` 下的保镖/看门狗属 root:wheel，任何功能都不要改回写 `~/.local/bin/` 下的同名脚本（用户可写=提权面）；需要变更时引导用户重跑安装器
 
 ## 问题修复决策规则（Agent 必须遵守）

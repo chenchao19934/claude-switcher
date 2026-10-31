@@ -11,6 +11,7 @@ import re
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,6 @@ import zipfile
 REPOSITORY = "chenchao19934/claude-switcher"
 REQUIRED = {
     "core/claude-switch.sh", "core/stun-probe.py", "core/desktop-update.py",
-    "app/main.swift", "assets/icon-2048.png",
 }
 CONFIG_KEYS = ("PROXY_MODE", "PROXY_GROUP", "COUNTRY_TARGET", "TZ_TARGET", "LOCALE_TARGET")
 AUDIT_KEYS = {
@@ -38,6 +38,10 @@ MAX_EXPANDED = 240 * 1024 * 1024
 
 
 class UpdateError(Exception):
+    pass
+
+
+class ReleaseUnavailable(UpdateError):
     pass
 
 
@@ -63,7 +67,7 @@ def ensure_plain(path, directory=None):
     return path
 
 
-def tree_digest(path):
+def tree_digest(path, ignored=()):
     root = ensure_plain(path, True)
     value = hashlib.sha256()
     for item in sorted(root.rglob("*")):
@@ -71,6 +75,8 @@ def tree_digest(path):
         if not (item.is_dir() or item.is_file()):
             raise UpdateError("App 包含不支持的文件类型")
         relative = item.relative_to(root).as_posix()
+        if any(relative == prefix or relative.startswith(prefix + "/") for prefix in ignored):
+            continue
         value.update((relative + "\0" + oct(stat.S_IMODE(item.stat().st_mode)) + "\0").encode())
         if item.is_file():
             value.update(digest(item).encode())
@@ -188,21 +194,22 @@ def safe_extract(archive, destination):
             if len(members) > 15000 or sum(item.file_size for item in members) > MAX_EXPANDED:
                 raise UpdateError("下载包展开后超过大小限制")
             seen = set()
-            roots = set()
             for item in members:
                 path = PurePosixPath(item.filename)
                 mode = item.external_attr >> 16
                 if (not item.filename or path.is_absolute() or ".." in path.parts
                         or "\\" in item.filename or "\x00" in item.filename
-                        or item.filename in seen or stat.S_ISLNK(mode)
+                        or item.filename.rstrip("/") != path.as_posix()
+                        or path.as_posix() in seen or stat.S_ISLNK(mode)
                         or (stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR))):
                     raise UpdateError("下载包包含不安全路径或符号链接")
-                seen.add(item.filename)
-                roots.add(path.parts[0])
-            if len(roots) != 1:
-                raise UpdateError("下载包结构异常")
+                seen.add(path.as_posix())
             handle.extractall(destination)
-            return Path(destination) / roots.pop()
+            for item in members:
+                target = Path(destination) / item.filename
+                archived_mode = item.external_attr >> 16
+                target.chmod(0o755 if item.is_dir() or archived_mode & 0o111 else 0o644)
+            return Path(destination)
     except (zipfile.BadZipFile, OSError) as error:
         raise UpdateError("下载包无法解压") from error
 
@@ -226,9 +233,130 @@ def verify_manifest(root, manifest):
         if digest(target) != checksum.lower():
             raise UpdateError("SHA256 工件校验失败，已中止")
         entries[relative] = checksum.lower()
+    allowed = REQUIRED | {"daemons/" + name for name in DAEMON_FILES}
     if not REQUIRED.issubset(entries):
         raise UpdateError("SHA256 校验清单缺少必要更新工件")
+    if not set(entries).issubset(allowed):
+        raise UpdateError("更新包内部校验清单包含未知工件")
     return entries
+
+
+def release_version(value):
+    if not isinstance(value, str) or len(value) > 64 or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", value):
+        raise UpdateError("正式发布版本号无效")
+    return value
+
+
+def version_key(value):
+    # Older source installers used 1.0; development packages used 0.0.0-dev.
+    if not isinstance(value, str) or len(value) > 80:
+        raise UpdateError("无法识别本机 App 版本，请使用正式安装包更新")
+    match = re.fullmatch(r"([0-9]+)(?:\.([0-9]+))?(?:\.([0-9]+))?(-[0-9A-Za-z.-]+)?", value)
+    if not match:
+        raise UpdateError("无法识别本机 App 版本，请使用正式安装包更新")
+    return tuple(int(value or 0) for value in match.groups()[:3]) + (0 if match[4] else 1,)
+
+
+def release_assets(metadata, arch):
+    if not isinstance(metadata, dict) or metadata.get("draft") is not False or metadata.get("prerelease") is not False:
+        raise UpdateError("尚无可用的正式发布版本")
+    tag = metadata.get("tag_name")
+    if not isinstance(tag, str) or not tag.startswith("v"):
+        raise UpdateError("正式发布标签无效")
+    version = release_version(tag[1:])
+    if arch not in {"arm64", "x86_64"}:
+        raise UpdateError("当前处理器架构暂无正式更新包")
+    filename = "ClaudeSwitcher-" + version + "-macos-" + arch + "-update.zip"
+    expected = {filename, "SHA256SUMS-release.txt"}
+    assets = metadata.get("assets")
+    if not isinstance(assets, list) or len(assets) > 100:
+        raise UpdateError("正式发布缺少更新安装包")
+    found = {}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            raise UpdateError("正式发布资产信息无效")
+        name = asset.get("name")
+        if not isinstance(name, str):
+            raise UpdateError("正式发布资产名称无效")
+        if name not in expected:
+            continue
+        url = "https://github.com/" + REPOSITORY + "/releases/download/" + tag + "/" + name
+        if name in found or asset.get("browser_download_url") != url:
+            raise UpdateError("正式发布资产地址不可信或重复")
+        size = asset.get("size")
+        limit = MAX_ARCHIVE if name == filename else 256 * 1024
+        if type(size) is not int or not 0 < size <= limit:
+            raise UpdateError("正式发布资产大小无效")
+        found[name] = url
+    if set(found) != expected:
+        raise UpdateError("正式发布缺少当前架构更新包或校验清单")
+    return version, filename, found
+
+
+def verify_release_checksum(manifest, filename, archive):
+    checksums = {}
+    try:
+        lines = Path(manifest).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise UpdateError("无法读取正式发布校验清单") from error
+    for line in lines:
+        match = re.fullmatch(r"([0-9a-fA-F]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+        if not match or match[2] in checksums or match[2] in {".", ".."}:
+            raise UpdateError("正式发布校验清单格式无效或包含重复项")
+        checksums[match[2]] = match[1].lower()
+    if filename not in checksums or digest(archive) != checksums[filename]:
+        raise UpdateError("正式更新安装包 SHA256 校验失败，已中止")
+
+
+def macho_architectures(path):
+    target = ensure_plain(path, False)
+    size = target.stat().st_size
+    thin = {b"\xcf\xfa\xed\xfe": ("<", 32), b"\xfe\xed\xfa\xcf": (">", 32),
+            b"\xce\xfa\xed\xfe": ("<", 28), b"\xfe\xed\xfa\xce": (">", 28)}
+    fat = {b"\xca\xfe\xba\xbe": (">", 20), b"\xbe\xba\xfe\xca": ("<", 20),
+           b"\xca\xfe\xba\xbf": (">", 32), b"\xbf\xba\xfe\xca": ("<", 32)}
+    names = {0x0100000c: "arm64", 0x01000007: "x86_64"}
+    def thin_cpu(handle, offset, length):
+        handle.seek(offset)
+        header = handle.read(min(length, 32))
+        if len(header) < 4 or header[:4] not in thin:
+            raise UpdateError("更新 App 可执行文件不是有效的 Mach-O")
+        endian, minimum = thin[header[:4]]
+        if length < minimum or len(header) < minimum:
+            raise UpdateError("更新 App Mach-O 头不完整")
+        cpu = struct.unpack(endian + "I", header[4:8])[0]
+        if cpu in names and minimum != 32:
+            raise UpdateError("更新 App Mach-O 架构声明无效")
+        return cpu
+    with target.open("rb") as handle:
+        magic = handle.read(4)
+        if magic in thin:
+            return {names.get(thin_cpu(handle, 0, size), "unsupported")}
+        if magic not in fat or size < 8:
+            raise UpdateError("更新 App 可执行文件不是有效的 Mach-O")
+        endian, stride = fat[magic]
+        count = struct.unpack(endian + "I", handle.read(4))[0]
+        if not 1 <= count <= 32 or 8 + count * stride > size:
+            raise UpdateError("更新 App 通用二进制头无效")
+        table_end = 8 + count * stride
+        slices = []
+        cpus = set()
+        for index in range(count):
+            handle.seek(8 + index * stride)
+            raw = handle.read(stride)
+            fields = struct.unpack(endian + ("IIIII" if stride == 20 else "IIQQII"), raw)
+            cpu, _, offset, length, alignment = fields[:5]
+            if (offset < table_end or length < 28 or offset + length > size or alignment > 31
+                    or offset % (1 << alignment) or (stride == 32 and fields[5] != 0)
+                    or cpu in cpus):
+                raise UpdateError("更新 App 通用二进制分段无效")
+            if any(offset < old_offset + old_length and old_offset < offset + length for old_offset, old_length in slices):
+                raise UpdateError("更新 App 通用二进制分段重叠")
+            if thin_cpu(handle, offset, length) != cpu:
+                raise UpdateError("更新 App 通用二进制架构不一致")
+            slices.append((offset, length))
+            cpus.add(cpu)
+        return {names.get(cpu, "unsupported") for cpu in cpus}
 
 
 def config_values(source):
@@ -352,63 +480,66 @@ class Backend:
         if not target.is_file() or target.stat().st_size > limit or target.stat().st_size == 0:
             raise UpdateError("下载内容为空或超过大小限制")
 
-    def fetch(self, work):
-        metadata = work / "commit.json"
-        self.download("https://api.github.com/repos/" + REPOSITORY + "/commits/main", metadata, 2 * 1024 * 1024)
+    def release_info(self, work):
+        metadata = work / "release.json"
         try:
-            revision = json.loads(metadata.read_text(encoding="utf-8"))["sha"]
-        except (ValueError, KeyError, TypeError, OSError) as error:
-            raise UpdateError("无法识别远端版本信息") from error
-        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
-            raise UpdateError("远端版本标识无效")
-        archive, manifest = work / "source.zip", work / "SHA256SUMS"
-        self.download("https://codeload.github.com/" + REPOSITORY + "/zip/" + revision, archive, MAX_ARCHIVE)
-        self.download("https://raw.githubusercontent.com/" + REPOSITORY + "/" + revision + "/SHA256SUMS", manifest, 256 * 1024)
-        root = safe_extract(archive, work / "source")
-        entries = verify_manifest(root, manifest)
-        return revision, root, entries
+            self.download("https://api.github.com/repos/" + REPOSITORY + "/releases/latest", metadata, 2 * 1024 * 1024)
+        except UpdateError as error:
+            if "HTTP 404" in str(error):
+                raise ReleaseUnavailable("仓库尚无正式发布版本") from error
+            raise
+        try:
+            release = json.loads(metadata.read_text(encoding="utf-8"))
+        except (ValueError, TypeError, OSError) as error:
+            raise UpdateError("无法识别正式发布版本信息") from error
+        return release_assets(release, os.uname().machine)
+
+    def fetch(self, work):
+        version, filename, assets = self.release_info(work)
+        archive, manifest = work / filename, work / "SHA256SUMS-release.txt"
+        self.download(assets["SHA256SUMS-release.txt"], manifest, 256 * 1024)
+        self.download(assets[filename], archive, MAX_ARCHIVE)
+        verify_release_checksum(manifest, filename, archive)
+        root = safe_extract(archive, work / "package")
+        allowed_roots = {"Claude切换器.app", "core", "daemons", "SHA256SUMS", "VERSION"}
+        if not {"Claude切换器.app", "core", "SHA256SUMS", "VERSION"}.issubset({p.name for p in root.iterdir()}) or any(p.name not in allowed_roots for p in root.iterdir()):
+            raise UpdateError("正式更新包结构异常")
+        if ensure_plain(root / "VERSION", False).read_text(encoding="utf-8").strip() != version:
+            raise UpdateError("正式更新包版本与发布版本不一致")
+        entries = verify_manifest(root, root / "SHA256SUMS")
+        self.verify_bundle(root / "Claude切换器.app", version, entries)
+        return version, root, entries
 
     def command(self, args, timeout=20):
         try:
             result = subprocess.run(args, capture_output=True, timeout=self.remaining(timeout))
         except (OSError, subprocess.TimeoutExpired) as error:
-            raise UpdateError("更新构建失败或超时，未替换已安装版本") from error
+            raise UpdateError("安装包校验失败或超时，未替换已安装版本") from error
         if result.returncode:
-            raise UpdateError("更新构建或签名校验失败，未替换已安装版本")
+            raise UpdateError("安装包签名或可执行文件校验失败，未替换已安装版本")
         return result
 
-    def build(self, source, output, old_app, revision, entries):
-        contents = output / "Contents"
-        (contents / "MacOS").mkdir(parents=True)
-        (contents / "Resources").mkdir()
-        try:
-            info = plistlib.loads((old_app / "Contents/Info.plist").read_bytes())
-        except (ValueError, OSError) as error:
-            raise UpdateError("现有 App 信息无效") from error
-        info.update({"CFBundleExecutable": "ClaudeSwitcher", "CFBundleIdentifier": "local.claude-switcher",
-                     "CFBundleIconFile": "AppIcon", "LSMinimumSystemVersion": "13.0",
-                     "ClaudeSwitcherSourceRevision": revision,
-                     "ClaudeSwitcherAppSourceSHA256": entries["app/main.swift"],
-                     "ClaudeSwitcherIconSourceSHA256": entries["assets/icon-2048.png"]})
-        (contents / "Info.plist").write_bytes(plistlib.dumps(info))
-        shutil.copyfile(source / "core/desktop-update.py", contents / "Resources/desktop-update.py")
-        arch = os.uname().machine
-        if arch not in {"arm64", "x86_64"}:
-            raise UpdateError("当前处理器架构不支持自动构建")
-        self.command(["/usr/bin/swiftc", "-O", "-parse-as-library", "-target", arch + "-apple-macos13.0",
-                      str(source / "app/main.swift"), "-o", str(contents / "MacOS/ClaudeSwitcher"),
-                      "-framework", "SwiftUI", "-framework", "AppKit"], timeout=240)
-        iconset = output.parent / "AppIcon.iconset"
-        iconset.mkdir()
-        for size in (16, 32, 128, 256, 512):
-            for scale in (1, 2):
-                suffix = "@2x" if scale == 2 else ""
-                self.command(["/usr/bin/sips", "-z", str(size * scale), str(size * scale),
-                              str(source / "assets/icon-2048.png"), "--out",
-                              str(iconset / ("icon_%dx%d%s.png" % (size, size, suffix)))])
-        self.command(["/usr/bin/iconutil", "-c", "icns", str(iconset), "-o", str(contents / "Resources/AppIcon.icns")])
-        self.command(["/usr/bin/codesign", "--force", "--deep", "-s", "-", str(output)])
-        self.command(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(output)])
+    def verify_bundle(self, app, version, entries):
+        tree_digest(app)
+        info = read_plist(app / "Contents/Info.plist")
+        if (info.get("CFBundleIdentifier") != "local.claude-switcher"
+                or info.get("CFBundleExecutable") != "ClaudeSwitcher"
+                or info.get("CFBundleShortVersionString") != version):
+            raise UpdateError("正式安装包 App 标识或版本不匹配")
+        executable = ensure_plain(app / "Contents/MacOS/ClaudeSwitcher", False)
+        if not executable.stat().st_mode & 0o111 or os.uname().machine not in macho_architectures(executable):
+            raise UpdateError("正式安装包与当前处理器架构不匹配")
+        helper = ensure_plain(app / "Contents/Resources/desktop-update.py", False)
+        if digest(helper) != entries["core/desktop-update.py"]:
+            raise UpdateError("App 内置更新组件与安装包不一致")
+        if (app / "Contents/PlugIns").exists() or info.get("ClaudeSwitcherAppGroup"):
+            raise UpdateError("正式小组件安装包需要使用相同签名的专用更新渠道")
+        self.command(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)])
+
+    def build(self, source, output, old_app, version, entries):
+        # This copies a CI-built, checksum-verified bundle; no developer tools run locally.
+        shutil.copytree(source / "Claude切换器.app", output)
+        self.verify_bundle(output, version, entries)
 
     def audit(self, core):
         # The caller's installed settings/defaults must be used; no Claude launch occurs.
@@ -510,30 +641,47 @@ class Updater:
         tree_digest(self.app)
         config_values(self.core.read_text(encoding="utf-8"))
 
-    def current(self, entries, revision):
+    def current(self, entries, version):
+        self.component_repair = False
         info = read_plist(self.app / "Contents/Info.plist")
-        if (info.get("ClaudeSwitcherAppSourceSHA256") != entries["app/main.swift"]
-                or info.get("ClaudeSwitcherIconSourceSHA256") != entries["assets/icon-2048.png"]):
+        local_key = version_key(info.get("CFBundleShortVersionString"))
+        remote_key = version_key(release_version(version))
+        if local_key > remote_key:
+            raise UpdateError("本机版本高于当前正式发布版本，已拒绝降级")
+        if local_key < remote_key:
             return False
-        bundled = self.app / "Contents/Resources/desktop-update.py"
-        if not bundled.is_file() or bundled.is_symlink() or digest(bundled) != entries["core/desktop-update.py"]:
+        candidate = self.source_core.parent.parent / "Claude切换器.app"
+        identical = (tree_digest(self.app) == tree_digest(candidate)
+                     and strip_config(self.core.read_text(encoding="utf-8")) == strip_config(self.source_core.read_text(encoding="utf-8"))
+                     and self.stun.is_file() and digest(self.stun) == entries["core/stun-probe.py"])
+        if not identical:
+            ignored = ("Contents/Resources/desktop-update.py", "Contents/_CodeSignature")
+            if tree_digest(self.app, ignored) != tree_digest(candidate, ignored):
+                raise UpdateError("同版本 App 主体与正式安装包不一致，请使用安装器修复")
+            self.component_repair = True
             return False
-        return (strip_config(self.core.read_text(encoding="utf-8")) ==
-                strip_config(self.source_core.read_text(encoding="utf-8"))) and (
-                self.stun.is_file() and digest(self.stun) == entries["core/stun-probe.py"])
+        return True
 
     def check(self):
-        self.validate_targets()
+        # Version checks need neither write access nor installed core/daemon probes.
+        ensure_plain(self.app, True)
+        info = read_plist(self.app / "Contents/Info.plist")
+        if info.get("CFBundleIdentifier") != "local.claude-switcher":
+            raise UpdateError("App 标识不匹配，已中止")
+        local_key = version_key(info.get("CFBundleShortVersionString"))
         if hasattr(self.backend, "begin"):
-            self.backend.begin(210)
+            self.backend.begin(90)
         with tempfile.TemporaryDirectory(prefix="claude-switcher-check-") as directory:
-            revision, source, entries = self.backend.fetch(Path(directory).resolve())
-            self.source_core = source / "core/claude-switch.sh"
-            current = self.current(entries, revision)
-            notice = self.daemon_notice(source, entries)
-            message = "界面和核心已是最新版本" if current else "发现新版本，可更新界面和核心脚本"
-            return {"state": "current" if current else "available", "version": revision[:12],
-                    "message": self.message_with_notice(message, notice)}
+            try:
+                version, _, _ = self.backend.release_info(Path(directory).resolve())
+            except ReleaseUnavailable:
+                return {"state": "unavailable", "message": "仓库尚无正式发布版本"}
+        remote_key = version_key(release_version(version))
+        if local_key > remote_key:
+            raise UpdateError("本机版本高于当前正式发布版本，已拒绝降级")
+        current = local_key == remote_key
+        return {"state": "current" if current else "available", "version": version,
+                "message": "当前版本已是 GitHub 最新正式版本" if current else "发现正式新版本，可更新界面和核心脚本"}
 
     def stage_path(self, token):
         try:
@@ -580,6 +728,10 @@ class Updater:
                 revision, source, entries = self.backend.fetch(stage)
                 self.source_core = source / "core/claude-switch.sh"
                 notice = self.daemon_notice(source, entries)
+                if self.current(entries, revision):
+                    shutil.rmtree(stage)
+                    return {"state": "current", "version": revision,
+                            "message": self.message_with_notice("界面和核心已是最新正式版本", notice)}
                 new_core = stage / "new-core.sh"
                 new_core.write_text(inject_config(self.source_core.read_text(encoding="utf-8"),
                                                  self.core.read_text(encoding="utf-8")), encoding="utf-8")
@@ -590,7 +742,7 @@ class Updater:
                 self.backend.build(source, stage / "new-app.app", self.app, revision, entries)
                 self.backend.audit(new_core)
                 record = {"schema": 1, "token": token, "created": time.time(), "phase": "prepared",
-                          "version": revision[:12], "notice": notice, "app": str(self.app), "core": str(self.core), "stun": str(self.stun),
+                          "version": revision, "notice": notice, "app": str(self.app), "core": str(self.core), "stun": str(self.stun),
                           "original": original, "new": {"app": tree_digest(stage / "new-app.app"),
                           "core": digest(new_core), "stun": digest(stage / "new-stun.py")}}
                 self.assert_originals(record)
@@ -598,8 +750,8 @@ class Updater:
                 (stage / "worker.py").chmod(0o600)
                 record["worker"] = digest(stage / "worker.py")
                 write_json(stage / "receipt.json", record)
-                return {"state": "prepared", "version": revision[:12], "token": token,
-                        "message": self.message_with_notice("下载、校验、编译和完整检查已通过，可以重启完成更新", notice)}
+                return {"state": "prepared", "version": revision, "token": token,
+                        "message": self.message_with_notice("正式安装包下载、校验和完整检查已通过，可以重启完成更新", notice)}
             except BaseException:
                 shutil.rmtree(stage)
                 raise

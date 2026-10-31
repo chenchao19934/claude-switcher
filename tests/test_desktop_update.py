@@ -6,6 +6,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import stat
+import struct
 import tempfile
 import threading
 import types
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("desktop_update", ROOT / "core/desktop-update.py")
 UPDATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(UPDATE)
-REVISION = "a" * 40
+REVISION = "1.1.0"
 CORE = '\n'.join(key + '="' + value + '"' for key, value in zip(
     UPDATE.CONFIG_KEYS, ("clash-verge", "Example Group", "US", "America/New_York", "en_US"))) + '\n# fixture\n'
 AUDIT = '\n'.join(key + '=ok' for key in UPDATE.AUDIT_KEYS)
@@ -60,33 +61,35 @@ class FakeBackend:
         self.processes = []
         self.spawned = []
         self.revision = REVISION
+        self.info_calls = 0
+        self.fetch_calls = 0
+
+    def release_info(self, work):
+        self.info_calls += 1
+        filename = f'ClaudeSwitcher-{self.revision}-macos-{os.uname().machine}-update.zip'
+        return self.revision, filename, {}
 
     def fetch(self, work):
+        self.fetch_calls += 1
         source = work / 'download'
         shutil.copytree(self.fixture.source, source)
+        if (source / 'VERSION').read_text().strip() != self.revision:
+            raise UPDATE.UpdateError('模拟安装包版本不符')
         entries = UPDATE.verify_manifest(source, source / 'SHA256SUMS')
+        self.verify_bundle(source / 'Claude切换器.app', self.revision, entries)
         return self.revision, source, entries
 
     def command(self, args, timeout=None):
-        if args[:2] != ['/bin/bash', '-n']:
+        if args[:2] not in (['/bin/bash', '-n'], ['/usr/bin/codesign', '--verify']):
             raise AssertionError('unexpected external command')
+        return mock.Mock(returncode=0)
+
+    verify_bundle = UPDATE.Backend.verify_bundle
 
     def build(self, source, output, old_app, revision, entries):
         if self.build_fails:
-            raise UPDATE.UpdateError('模拟编译失败')
-        resources = output / 'Contents/Resources'
-        resources.mkdir(parents=True)
-        executable = output / 'Contents/MacOS/ClaudeSwitcher'
-        executable.parent.mkdir()
-        executable.write_text('new executable')
-        executable.chmod(0o700)
-        info = {'CFBundleIdentifier': 'local.claude-switcher',
-                'CFBundleExecutable': 'ClaudeSwitcher',
-                'ClaudeSwitcherSourceRevision': revision,
-                'ClaudeSwitcherAppSourceSHA256': entries['app/main.swift'],
-                'ClaudeSwitcherIconSourceSHA256': entries['assets/icon-2048.png']}
-        (output / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
-        shutil.copyfile(source / 'core/desktop-update.py', resources / 'desktop-update.py')
+            raise UPDATE.UpdateError('模拟安装包校验失败')
+        UPDATE.Backend.build(self, source, output, old_app, revision, entries)
 
     def audit(self, core):
         self.audit_calls += 1
@@ -114,7 +117,7 @@ class FakeBackend:
 
     def spawn_worker(self, helper, app, core, token, pid):
         self.spawned.append((helper, app, core, token, pid))
-        UPDATE.write_json(helper.parent / 'worker-ready.json', {'token': token, 'version': self.revision[:12]})
+        UPDATE.write_json(helper.parent / 'worker-ready.json', {'token': token, 'version': self.revision})
 
 
 class DesktopUpdateTests(unittest.TestCase):
@@ -136,12 +139,25 @@ class DesktopUpdateTests(unittest.TestCase):
         (self.app / 'Contents/Resources').mkdir()
         (self.app / 'Contents/MacOS/ClaudeSwitcher').write_text('old executable')
         (self.app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
-            'CFBundleIdentifier': 'local.claude-switcher', 'CFBundleExecutable': 'ClaudeSwitcher'}))
+            'CFBundleIdentifier': 'local.claude-switcher', 'CFBundleExecutable': 'ClaudeSwitcher',
+            'CFBundleShortVersionString': '1.0.0'}))
         self.source = self.root / 'source'
         for relative in UPDATE.REQUIRED:
             path = self.source / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(CORE if relative == 'core/claude-switch.sh' else 'new ' + relative)
+        self.package_app = self.source / 'Claude切换器.app'
+        (self.package_app / 'Contents/MacOS').mkdir(parents=True)
+        (self.package_app / 'Contents/Resources').mkdir()
+        cpu = 0x0100000c if os.uname().machine == 'arm64' else 0x01000007
+        executable = self.package_app / 'Contents/MacOS/ClaudeSwitcher'
+        executable.write_bytes(struct.pack('<IIIIIIII', 0xfeedfacf, cpu, 0, 2, 0, 0, 0, 0))
+        executable.chmod(0o755)
+        (self.package_app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+            'CFBundleIdentifier': 'local.claude-switcher', 'CFBundleExecutable': 'ClaudeSwitcher',
+            'CFBundleShortVersionString': REVISION, 'CFBundleVersion': REVISION}))
+        shutil.copyfile(self.source / 'core/desktop-update.py', self.package_app / 'Contents/Resources/desktop-update.py')
+        (self.source / 'VERSION').write_text(REVISION + '\n')
         self.manifest()
         self.backend = FakeBackend(self)
         self.managed = self.root / 'managed'
@@ -186,8 +202,14 @@ class DesktopUpdateTests(unittest.TestCase):
         token = self.prepare()
         self.assertEqual(self.worker(token)['state'], 'updated')
         self.assertEqual(self.updater.check()['state'], 'current')
-        (self.source / 'app/main.swift').write_text('GUI only change')
-        self.manifest()
+        (self.package_app / 'Contents/MacOS/ClaudeSwitcher').write_bytes(
+            (self.package_app / 'Contents/MacOS/ClaudeSwitcher').read_bytes() + b'GUI only change')
+        info_path = self.package_app / 'Contents/Info.plist'
+        info = plistlib.loads(info_path.read_bytes())
+        info['CFBundleShortVersionString'] = '1.2.0'
+        info_path.write_bytes(plistlib.dumps(info))
+        (self.source / 'VERSION').write_text('1.2.0\n')
+        self.backend.revision = '1.2.0'
         self.assertEqual(self.updater.check()['state'], 'available')
 
     def test_prepare_keeps_installed_files_and_private_receipt(self):
@@ -255,7 +277,7 @@ class DesktopUpdateTests(unittest.TestCase):
         for relative in UPDATE.REQUIRED:
             self.manifest(omit=relative)
             with self.assertRaises(UPDATE.UpdateError):
-                self.updater.check()
+                self.updater.prepare()
         self.manifest()
         (self.source / 'core/stun-probe.py').write_text('tampered')
         with self.assertRaises(UPDATE.UpdateError):
@@ -266,7 +288,7 @@ class DesktopUpdateTests(unittest.TestCase):
         for extra in (valid.splitlines()[0], '0' * 64 + '  ../escape', '0' * 64 + '  /absolute'):
             (self.source / 'SHA256SUMS').write_text(valid + extra + '\n')
             with self.assertRaises(UPDATE.UpdateError):
-                self.updater.check()
+                self.updater.prepare()
 
     def test_literal_config_round_trip_with_quotes_backslashes_and_dollars(self):
         values = {'PROXY_GROUP': 'quote " and backslash \\ and literal $HOME `x`'}
@@ -319,7 +341,7 @@ class DesktopUpdateTests(unittest.TestCase):
         self.core.rename(outside)
         self.core.symlink_to(outside)
         with self.assertRaises(UPDATE.UpdateError):
-            self.updater.check()
+            self.updater.prepare()
 
     def test_archive_traversal_symlink_and_duplicate_rejected(self):
         for name, link, duplicate in (('../escape', False, False), ('/absolute', False, False),
@@ -378,7 +400,7 @@ class DesktopUpdateTests(unittest.TestCase):
     def test_widget_app_refuses_signature_downgrade(self):
         (self.app / 'Contents/PlugIns').mkdir()
         with self.assertRaises(UPDATE.UpdateError):
-            self.updater.check()
+            self.updater.prepare()
 
     def test_rollback_receipt_reports_failure_without_acknowledging(self):
         token = self.prepare()
@@ -408,7 +430,7 @@ class DesktopUpdateTests(unittest.TestCase):
         self.managed_components()
         (self.managed / 'tz-watchdog.sh').write_text('old version\n')
         before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode) for p in self.managed.iterdir()}
-        self.assertIn(UPDATE.DAEMON_CHANGED, self.updater.check()['message'])
+        self.assertNotIn('系统守护组件', self.updater.check()['message'])
         prepared = self.updater.prepare()
         self.assertIn(UPDATE.DAEMON_CHANGED, prepared['message'])
         token = prepared['token']
@@ -432,10 +454,10 @@ class DesktopUpdateTests(unittest.TestCase):
         result = self.updater.check()
         self.assertNotIn('系统守护组件', result['message'])
         self.manifest(omit='daemons/bodyguard-settings.py')
-        self.assertIn(UPDATE.DAEMON_UNKNOWN, self.updater.check()['message'])
+        self.assertIn(UPDATE.DAEMON_UNKNOWN, self.updater.prepare()['message'])
         self.manifest()
         (self.managed / 'claude-bodyguard.sh').unlink()
-        self.assertIn(UPDATE.DAEMON_MISSING, self.updater.check()['message'])
+        self.assertIn(UPDATE.DAEMON_MISSING, self.updater.prepare()['message'])
         # The deletion above is the fixture's action; updater never recreates it.
         self.assertFalse((self.managed / 'claude-bodyguard.sh').exists())
         for name in ('tz-watchdog.sh', 'bodyguard-settings.py'):
@@ -584,6 +606,250 @@ class DesktopUpdateTests(unittest.TestCase):
             self.assertIn(expected, str(raised.exception))
             self.assertNotIn('203.0.113', str(raised.exception))
             self.assertNotIn('secret', str(raised.exception))
+
+    def release_fixture(self, metadata_change=None, mutate_package=None, mutate_zip=None):
+        version = REVISION
+        arch = os.uname().machine
+        filename = f'ClaudeSwitcher-{version}-macos-{arch}-update.zip'
+        base = f'https://github.com/{UPDATE.REPOSITORY}/releases/download/v{version}/'
+        metadata = {'tag_name': 'v' + version, 'draft': False, 'prerelease': False, 'assets': [
+            {'name': filename, 'browser_download_url': base + filename, 'size': 1000},
+            {'name': 'SHA256SUMS-release.txt', 'browser_download_url': base + 'SHA256SUMS-release.txt', 'size': 1000}]}
+        if metadata_change:
+            metadata_change(metadata)
+        if mutate_package:
+            mutate_package()
+        archive = self.root / 'release-update.zip'
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as handle:
+            for path in sorted(self.source.rglob('*')):
+                handle.write(path, path.relative_to(self.source).as_posix())
+        checksum = UPDATE.digest(archive) + '  ' + filename + '\n'
+        if mutate_zip:
+            mutate_zip(archive)
+        calls = []
+        def download(url, target, limit):
+            calls.append(url)
+            if url.endswith('/releases/latest'):
+                target.write_text(json.dumps(metadata))
+            elif url.endswith('/SHA256SUMS-release.txt'):
+                target.write_text(checksum)
+            elif url.endswith('/' + filename):
+                shutil.copyfile(archive, target)
+            else:
+                self.fail('unexpected download URL')
+        backend = UPDATE.Backend()
+        backend.download = download
+        commands = []
+        def command(args, timeout=20):
+            commands.append(args)
+            self.assertEqual(args[:4], ['/usr/bin/codesign', '--verify', '--deep', '--strict'])
+            return mock.Mock(returncode=0)
+        backend.command = command
+        return backend, calls, commands
+
+    def test_check_downloads_only_latest_metadata_and_reports_versions(self):
+        backend, calls, commands = self.release_fixture()
+        self.updater.backend = backend
+        result = self.updater.check()
+        self.assertEqual(result['state'], 'available')
+        self.assertEqual(result['version'], REVISION)
+        self.assertEqual(calls, ['https://api.github.com/repos/' + UPDATE.REPOSITORY + '/releases/latest'])
+        self.assertFalse(commands)
+        self.assertFalse((self.stun.parent / '.update.lock').exists())
+        info_path = self.app / 'Contents/Info.plist'
+        info = plistlib.loads(info_path.read_bytes())
+        info['CFBundleShortVersionString'] = REVISION
+        info_path.write_bytes(plistlib.dumps(info))
+        self.assertEqual(self.updater.check()['state'], 'current')
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(url.endswith('/releases/latest') for url in calls))
+        self.assertFalse(commands)
+
+    def test_check_does_not_read_core_probe_or_run_audit(self):
+        self.core.unlink()
+        self.stun.unlink()
+        self.backend.build_fails = True
+        self.backend.audit_rc = 99
+        result = self.updater.check()
+        self.assertEqual(result['state'], 'available')
+        self.assertEqual(self.backend.info_calls, 1)
+        self.assertEqual(self.backend.fetch_calls, 0)
+        self.assertEqual(self.backend.audit_calls, 0)
+        self.assertFalse((self.stun.parent / '.update.lock').exists())
+
+    def test_check_no_release_is_successful_unavailable_but_prepare_errors(self):
+        backend = UPDATE.Backend()
+        backend.download = mock.Mock(side_effect=UPDATE.UpdateError('下载服务器返回 HTTP 404'))
+        self.updater.backend = backend
+        result = self.updater.check()
+        self.assertEqual(result, {'state': 'unavailable', 'message': '仓库尚无正式发布版本'})
+        self.assertNotIn('version', result)
+        with self.assertRaises(UPDATE.ReleaseUnavailable):
+            self.updater.prepare()
+        self.assertFalse((self.stun.parent / '.update.lock').exists())
+        self.assertFalse(list(self.app.parent.glob('.claude-switcher-update-*')))
+
+    def test_release_fetch_uses_only_stable_asset_urls_and_prebuilt_bundle(self):
+        backend, calls, commands = self.release_fixture()
+        work = self.root / 'fetch-work'
+        work.mkdir()
+        version, package, entries = backend.fetch(work)
+        self.assertEqual(version, REVISION)
+        self.assertTrue(UPDATE.REQUIRED.issubset(entries))
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(calls[0].endswith('/releases/latest'))
+        self.assertTrue(all('/releases/download/v1.1.0/' in url for url in calls[1:]))
+        self.assertFalse(any(fragment in ' '.join(calls) for fragment in ('commits/main', 'codeload', 'raw.githubusercontent')))
+        executable = package / 'Claude切换器.app/Contents/MacOS/ClaudeSwitcher'
+        self.assertTrue(executable.stat().st_mode & 0o111)
+        self.assertEqual(UPDATE.macho_architectures(executable), {os.uname().machine})
+        output = self.root / 'copied-app.app'
+        backend.build(package, output, self.app, version, entries)
+        self.assertEqual(UPDATE.tree_digest(output), UPDATE.tree_digest(package / 'Claude切换器.app'))
+        self.assertEqual(len(commands), 2)
+
+    def test_release_metadata_rejects_untrusted_urls_and_missing_assets(self):
+        changes = [lambda m: m.update(draft=True), lambda m: m.update(prerelease=True),
+                   lambda m: m.update(tag_name='v../escape'), lambda m: m.update(tag_name='v1.1.0-beta'),
+                   lambda m: m.update(assets=[]),
+                   lambda m: m['assets'][0].update(browser_download_url='https://evil.invalid/payload'),
+                   lambda m: m['assets'][0].update(browser_download_url=m['assets'][0]['browser_download_url'] + '?extra'),
+                   lambda m: m['assets'].append(dict(m['assets'][0]))]
+        for index, change in enumerate(changes):
+            with self.subTest(index=index):
+                backend, calls, _ = self.release_fixture(metadata_change=change)
+                work = self.root / f'bad-release-{index}'
+                work.mkdir()
+                with self.assertRaises(UPDATE.UpdateError):
+                    backend.fetch(work)
+                self.assertEqual(len(calls), 1)
+
+    def test_no_formal_release_404_has_specific_error(self):
+        backend = UPDATE.Backend()
+        backend.download = mock.Mock(side_effect=UPDATE.UpdateError('下载服务器返回 HTTP 404'))
+        with self.assertRaises(UPDATE.UpdateError) as raised:
+            backend.fetch(self.root)
+        self.assertIn('尚无正式发布版本', str(raised.exception))
+
+    def test_release_zip_checksum_tampering_stops_before_extract(self):
+        backend, _, commands = self.release_fixture(mutate_zip=lambda path: path.write_bytes(path.read_bytes() + b'tampered'))
+        work = self.root / 'tampered-release'
+        work.mkdir()
+        with self.assertRaises(UPDATE.UpdateError) as raised:
+            backend.fetch(work)
+        self.assertIn('SHA256', str(raised.exception))
+        self.assertFalse((work / 'package').exists())
+        self.assertFalse(commands)
+
+    def test_release_missing_version_or_version_mismatch_rejected(self):
+        for index, change in enumerate((lambda: (self.source / 'VERSION').unlink(),
+                                        lambda: (self.source / 'VERSION').write_text('9.9.9\n'))):
+            (self.source / 'VERSION').write_text(REVISION + '\n')
+            backend, _, _ = self.release_fixture(mutate_package=change)
+            work = self.root / f'bad-version-{index}'
+            work.mkdir()
+            with self.assertRaises(UPDATE.UpdateError):
+                backend.fetch(work)
+
+    def test_release_bundle_architecture_identifier_and_signature_rejected(self):
+        entries = UPDATE.verify_manifest(self.source, self.source / 'SHA256SUMS')
+        backend = UPDATE.Backend()
+        backend.command = mock.Mock(return_value=mock.Mock(returncode=0))
+        executable = self.package_app / 'Contents/MacOS/ClaudeSwitcher'
+        wrong_cpu = 0x01000007 if os.uname().machine == 'arm64' else 0x0100000c
+        executable.write_bytes(struct.pack('<IIIIIIII', 0xfeedfacf, wrong_cpu, 0, 2, 0, 0, 0, 0))
+        with self.assertRaises(UPDATE.UpdateError):
+            backend.verify_bundle(self.package_app, REVISION, entries)
+        correct_cpu = 0x0100000c if os.uname().machine == 'arm64' else 0x01000007
+        executable.write_bytes(struct.pack('<IIIIIIII', 0xfeedfacf, correct_cpu, 0, 2, 0, 0, 0, 0))
+        info_path = self.package_app / 'Contents/Info.plist'
+        info = plistlib.loads(info_path.read_bytes())
+        info['CFBundleIdentifier'] = 'other.app'
+        info_path.write_bytes(plistlib.dumps(info))
+        with self.assertRaises(UPDATE.UpdateError):
+            backend.verify_bundle(self.package_app, REVISION, entries)
+        info['CFBundleIdentifier'] = 'local.claude-switcher'
+        info_path.write_bytes(plistlib.dumps(info))
+        backend.command = mock.Mock(side_effect=UPDATE.UpdateError('模拟签名校验失败'))
+        with self.assertRaises(UPDATE.UpdateError):
+            backend.verify_bundle(self.package_app, REVISION, entries)
+
+    def test_release_manifest_rejects_missing_duplicate_or_unsafe_asset_names(self):
+        archive = self.root / 'asset.zip'
+        archive.write_bytes(b'fixture')
+        manifest = self.root / 'SHA256SUMS-release.txt'
+        valid = UPDATE.digest(archive) + '  asset.zip\n'
+        for text in ('', valid + valid, UPDATE.digest(archive) + '  ../asset.zip\n',
+                     UPDATE.digest(archive) + '  /asset.zip\n'):
+            manifest.write_text(text)
+            with self.assertRaises(UPDATE.UpdateError):
+                UPDATE.verify_release_checksum(manifest, 'asset.zip', archive)
+        manifest.write_text(valid)
+        UPDATE.verify_release_checksum(manifest, 'asset.zip', archive)
+
+    def test_same_version_mixed_core_probe_or_helper_can_be_repaired(self):
+        token = self.prepare()
+        self.assertEqual(self.worker(token)['state'], 'updated')
+        for target in (self.core, self.stun, self.app / 'Contents/Resources/desktop-update.py'):
+            before = target.read_bytes()
+            target.write_bytes(before + b'\n# older component')
+            self.assertEqual(self.updater.check()['state'], 'current')
+            prepared = self.updater.prepare()
+            self.assertEqual(prepared['state'], 'prepared')
+            target.write_bytes(before)
+        self.assertEqual(self.updater.check()['state'], 'current')
+        self.assertEqual(self.updater.prepare()['state'], 'current')
+
+    def test_same_version_app_body_difference_is_not_silently_replaced(self):
+        token = self.prepare()
+        self.assertEqual(self.worker(token)['state'], 'updated')
+        executable = self.app / 'Contents/MacOS/ClaudeSwitcher'
+        executable.write_bytes(executable.read_bytes() + b'changed app')
+        self.assertEqual(self.updater.check()['state'], 'current')
+        with self.assertRaises(UPDATE.UpdateError):
+            self.updater.prepare()
+
+    def test_no_downgrade_and_legacy_version_comparison(self):
+        self.assertLess(UPDATE.version_key('0.0.0-dev'), UPDATE.version_key('0.0.0'))
+        self.assertEqual(UPDATE.version_key('1.0'), UPDATE.version_key('1.0.0'))
+        info_path = self.app / 'Contents/Info.plist'
+        info = plistlib.loads(info_path.read_bytes())
+        info['CFBundleShortVersionString'] = '9.0.0'
+        info_path.write_bytes(plistlib.dumps(info))
+        before = self.installed()
+        with self.assertRaises(UPDATE.UpdateError) as raised:
+            self.updater.check()
+        self.assertIn('拒绝降级', str(raised.exception))
+        self.assertEqual(before, self.installed())
+
+    def test_macho_thin_and_fat_endianness_and_boundaries(self):
+        path = self.root / 'MachO'
+        cpus = (0x0100000c, 0x01000007)
+        for endian in ('<', '>'):
+            for cpu, expected in zip(cpus, ('arm64', 'x86_64')):
+                path.write_bytes(struct.pack(endian + 'IIIIIIII', 0xfeedfacf, cpu, 0, 2, 0, 0, 0, 0))
+                self.assertEqual(UPDATE.macho_architectures(path), {expected})
+            for wide in (False, True):
+                stride = 32 if wide else 20
+                header = struct.pack(endian + 'II', 0xcafebabf if wide else 0xcafebabe, 2)
+                table = b''
+                for index, cpu in enumerate(cpus):
+                    fields = (cpu, 0, 4096 * (index + 1), 32, 12)
+                    table += struct.pack(endian + ('IIQQII' if wide else 'IIIII'), *(fields + ((0,) if wide else ())))
+                data = bytearray(8192 + 32)
+                data[:len(header + table)] = header + table
+                for index, cpu in enumerate(cpus):
+                    data[4096 * (index + 1):4096 * (index + 1) + 32] = struct.pack('<IIIIIIII', 0xfeedfacf, cpu, 0, 2, 0, 0, 0, 0)
+                path.write_bytes(data)
+                self.assertEqual(UPDATE.macho_architectures(path), {'arm64', 'x86_64'})
+                # Any truncated slice must fail before reading beyond the file.
+                path.write_bytes(data[:-1])
+                with self.assertRaises(UPDATE.UpdateError):
+                    UPDATE.macho_architectures(path)
+        for invalid in (b'', b'not MachO', b'\xca\xfe\xba\xbe' + struct.pack('>I', 99)):
+            path.write_bytes(invalid)
+            with self.assertRaises(UPDATE.UpdateError):
+                UPDATE.macho_architectures(path)
 
     def test_proxy_environment_uses_enabled_system_proxy_without_printing(self):
         backend = UPDATE.Backend()

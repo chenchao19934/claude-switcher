@@ -1781,7 +1781,7 @@ ASEOF
     echo "OK:region=$ctry tz=$ntz locale=$nlocale source=$src"
 }
 
-# 自动更新固定到同一提交；只读检查不初始化账号/日志/锁。
+# 自动更新仅使用 CI 正式 Release；只读检查不初始化账号/日志/锁。
 # 配置以原脚本的完整赋值行复制，禁止 eval 或通过 sed 插入值。
 self_update() {
     exec "${CLAUDE_SWITCHER_PYTHON:-python3}" -I -B - "$0" "${1:-}" <<'PY_CORE_UPDATE'
@@ -1806,8 +1806,12 @@ KEYS = {"代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区",
         "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性"}
 OPTIONAL = {"IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性"}
 ARTIFACTS = ("core/claude-switch.sh", "core/stun-probe.py", "core/desktop-update.py")
+DAEMONS = ("daemons/claude-bodyguard.sh", "daemons/tz-watchdog.sh", "daemons/bodyguard-settings.py")
 
 class UpdateError(Exception):
+    pass
+
+class NoRelease(Exception):
     pass
 
 def fail(message):
@@ -1850,7 +1854,7 @@ def proxy_environment():
         env["https_proxy"] = env["http_proxy"]
     return env
 
-def download(url, path, env, label, limit=1024 * 1024):
+def download(url, path, env, label, limit=1024 * 1024, release_lookup=False):
     command = ["curl", "-fLsS", "--proto", "=https", "--proto-redir", "=https", "--max-filesize", str(limit), "--retry", "2", "--retry-delay", "1", "--retry-max-time", "60",
                "--connect-timeout", "10", "--max-time", "30", "--output", str(path),
                "--write-out", "%{http_code}", url]
@@ -1863,6 +1867,8 @@ def download(url, path, env, label, limit=1024 * 1024):
     if result.returncode:
         if result.returncode == 22:
             code = result.stdout.strip()
+            if release_lookup and code == "404":
+                raise NoRelease("仓库尚无正式发布版本")
             detail = "HTTP " + code if re.fullmatch(r"[1-5][0-9]{2}", code) else "HTTP 请求失败"
         elif result.returncode == 28:
             detail = "连接或下载超时"
@@ -1882,21 +1888,71 @@ def download(url, path, env, label, limit=1024 * 1024):
     if path.stat().st_size > limit:
         fail(label + "超过大小限制，已中止")
 
-def verified_source(directory, env):
-    revision_file = directory / "revision.json"
-    download("https://api.github.com/repos/" + REPOSITORY + "/commits/main", revision_file, env, "获取更新版本")
+def read_manifest(path, required, exact=False, basenames=False):
+    hashes = {}
     try:
-        revision = json.loads(revision_file.read_text(encoding="utf-8"))["sha"]
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
+            if not match:
+                fail("校验清单格式无效，已中止")
+            checksum, relative = match.groups()
+            parsed = safe_path(relative)
+            if basenames and len(parsed.parts) != 1:
+                fail("发布校验清单包含非资产文件名，已中止")
+            if relative in hashes:
+                fail("校验清单存在重复项，已中止")
+            hashes[relative] = checksum.lower()
+    except (OSError, UnicodeError):
+        fail("无法读取校验清单，已中止")
+    if not set(required).issubset(hashes) or (exact and set(hashes) != set(required)):
+        fail("校验清单缺少必需工件或含非预期项，已中止")
+    return hashes
+
+def verified_source(directory, env):
+    metadata = directory / "release.json"
+    download("https://api.github.com/repos/" + REPOSITORY + "/releases/latest", metadata, env,
+             "获取正式发布版本", release_lookup=True)
+    try:
+        release = json.loads(metadata.read_text(encoding="utf-8"))
+        tag = release["tag_name"]
+        assets = release["assets"]
+        if release.get("draft") is not False or release.get("prerelease") is not False:
+            fail("更新源不是正式 Release，已中止")
     except (OSError, ValueError, KeyError, TypeError):
-        fail("更新版本响应无效，已中止")
-    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
-        fail("更新版本不是有效提交，已中止")
-    archive, manifest = directory / "source.zip", directory / "SHA256SUMS"
-    download("https://codeload.github.com/" + REPOSITORY + "/zip/" + revision, archive, env, "下载更新包", limit=128 * 1024 * 1024)
-    download("https://raw.githubusercontent.com/" + REPOSITORY + "/" + revision + "/SHA256SUMS", manifest, env, "下载校验清单")
-    unpacked = directory / "source"
-    unpacked.mkdir()
-    prefix = "claude-switcher-" + revision
+        fail("正式发布版本响应无效，已中止")
+    match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)", tag) if isinstance(tag, str) else None
+    if not match or not isinstance(assets, list):
+        fail("正式 Release 标签或资产列表无效，已中止")
+    version = match.group(1)
+    try:
+        architecture = subprocess.run(["uname", "-m"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        fail("无法确认本机架构，已中止")
+    arch = architecture.stdout.strip()
+    if architecture.returncode or arch not in ("arm64", "x86_64"):
+        fail("正式更新包不支持当前架构，已中止")
+    name = "ClaudeSwitcher-" + version + "-macos-" + arch + "-update.zip"
+    checksum_name = "SHA256SUMS-release.txt"
+    urls = {}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            fail("正式 Release 资产格式无效，已中止")
+        asset_name = asset.get("name")
+        if asset_name in (name, checksum_name):
+            expected = "https://github.com/" + REPOSITORY + "/releases/download/" + tag + "/" + asset_name
+            if asset_name in urls or asset.get("browser_download_url") != expected:
+                fail("正式 Release 资产 URL 或重复项异常，已中止")
+            urls[asset_name] = expected
+    if set(urls) != {name, checksum_name}:
+        fail("正式 Release 缺少当前架构更新包或校验清单，已中止")
+    archive, manifest = directory / name, directory / checksum_name
+    download(urls[checksum_name], manifest, env, "下载发布校验清单")
+    hashes = read_manifest(manifest, (name,), basenames=True)
+    download(urls[name], archive, env, "下载正式更新包", limit=128 * 1024 * 1024)
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != hashes[name]:
+        fail("正式更新包 SHA256 校验失败，已中止")
+    source = directory / "source"
+    source.mkdir()
     try:
         with zipfile.ZipFile(archive) as bundle:
             entries = bundle.infolist()
@@ -1904,37 +1960,29 @@ def verified_source(directory, env):
                 fail("远程包大小异常，已中止")
             seen = set()
             for info in entries:
-                name = info.filename.rstrip("/")
-                path = safe_path(name)
+                relative = info.filename.rstrip("/")
+                path = safe_path(relative)
                 kind = stat.S_IFMT(info.external_attr >> 16)
-                if path.parts[0] != prefix or name in seen or kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                if (path.parts[0] not in {"Claude切换器.app", "core", "daemons", "SHA256SUMS", "VERSION"}
+                        or relative in seen or kind not in (0, stat.S_IFREG, stat.S_IFDIR)):
                     fail("远程包路径、文件类型或重复项异常，已中止")
-                seen.add(name)
-            bundle.extractall(unpacked)
+                seen.add(relative)
+            bundle.extractall(source)
     except (OSError, ValueError, zipfile.BadZipFile, RuntimeError):
         fail("更新包解压失败或格式无效，已中止")
-    source = unpacked / prefix
-    hashes = {}
     try:
-        lines = manifest.read_text(encoding="utf-8").splitlines()
-        for line in lines:
-            match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
-            if not match:
-                fail("校验清单格式无效，已中止")
-            checksum, relative = match.groups()
-            safe_path(relative)
-            if relative in hashes:
-                fail("校验清单存在重复项，已中止")
-            hashes[relative] = checksum.lower()
-        if not set(ARTIFACTS).issubset(hashes):
-            fail("校验清单缺少必需工件，已中止")
+        if (source / "VERSION").read_text(encoding="utf-8").strip() != version:
+            fail("更新包 VERSION 与正式 Release 不一致，已中止")
+        if not (source / "Claude切换器.app/Contents/MacOS/ClaudeSwitcher").is_file():
+            fail("正式更新包缺少预编译 App，已中止")
+        hashes = read_manifest(source / "SHA256SUMS", ARTIFACTS + DAEMONS, exact=True)
         for relative, checksum in hashes.items():
             path = source / relative
             if not path.is_file() or path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
                 fail("工件 SHA256 校验失败，已中止")
     except (OSError, UnicodeError):
-        fail("无法读取校验清单或工件，已中止")
-    return source, revision
+        fail("无法读取正式更新包版本或工件，已中止")
+    return source, version
 
 def configuration(text):
     lines = {}
@@ -2106,7 +2154,7 @@ def main():
                 print("# update --auto 开始", flush=True)
         env = proxy_environment()
         with tempfile.TemporaryDirectory(prefix="claude-core-update-") as temporary:
-            source, revision = verified_source(Path(temporary), env)
+            source, version = verified_source(Path(temporary), env)
             old = core.read_text(encoding="utf-8")
             new = (source / ARTIFACTS[0]).read_text(encoding="utf-8")
             configuration(old); configuration(new)
@@ -2115,12 +2163,12 @@ def main():
                 path.is_file() and not path.is_symlink() and path.read_bytes() == (source / relative).read_bytes()
                 for path, relative in zip(destinations[1:], ARTIFACTS[1:]))
             if equal:
-                print("OK:核心及配套脚本已是最新版本")
+                print("OK:核心及配套脚本已与正式 Release " + version + " 一致")
             elif check:
-                print("INFO:发现新版核心及配套脚本（提交 " + revision[:12] + "）")
+                print("INFO:发现新版核心及配套脚本（正式 Release " + version + "）")
             else:
                 update(source, core, base, home)
-                print("OK:核心及配套脚本更新完成（提交 " + revision[:12] + "）")
+                print("OK:核心及配套脚本更新完成（正式 Release " + version + "）")
             print("INFO:本命令不更换 App；新版界面请使用界面中的更新 App 功能")
     except (OSError, UnicodeError) as error:
         fail("更新文件处理失败，已中止（" + type(error).__name__ + "）")
@@ -2144,6 +2192,8 @@ def main():
 
 try:
     main()
+except NoRelease as error:
+    print("INFO:" + str(error), flush=True)
 except UpdateError as error:
     print("FAIL:" + str(error), flush=True)
     raise SystemExit(1)

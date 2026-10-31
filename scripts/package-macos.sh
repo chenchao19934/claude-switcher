@@ -28,6 +28,7 @@ case "$ARCH" in
 esac
 ZIP="$BUILD/ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-app-only.zip"
 DMG="$BUILD/ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-app-only.dmg"
+UPDATE_ZIP="$BUILD/ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-update.zip"
 KIT_NAME="ClaudeSwitcher-$VERSION"
 KIT_ZIP="$BUILD/ClaudeSwitcher-$VERSION-installer-kit.zip"
 
@@ -36,7 +37,7 @@ cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
 mkdir -p "$BUILD"
-rm -rf "$APP" "$ZIP" "$DMG" "$KIT_ZIP"
+rm -rf "$APP" "$ZIP" "$DMG" "$KIT_ZIP" "$UPDATE_ZIP"
 
 echo "==> 编译 $APP_NAME $VERSION ($ARCH_LABEL)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -131,6 +132,31 @@ ln -s /Applications "$DMG_STAGE/Applications"
 hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$DMG_STAGE" \
     -ov -format UDZO "$DMG" >/dev/null
 
+echo "==> 生成架构对应的完整更新包"
+UPDATE_STAGE="$WORK/update"
+mkdir -p "$UPDATE_STAGE/core" "$UPDATE_STAGE/daemons"
+ditto "$APP" "$UPDATE_STAGE/$APP_NAME.app"
+cp "$ROOT/core/claude-switch.sh" "$ROOT/core/stun-probe.py" "$ROOT/core/desktop-update.py" "$UPDATE_STAGE/core/"
+cp "$ROOT/daemons/claude-bodyguard.sh" "$ROOT/daemons/tz-watchdog.sh" "$ROOT/daemons/bodyguard-settings.py" "$UPDATE_STAGE/daemons/"
+printf '%s\n' "$VERSION" > "$UPDATE_STAGE/VERSION"
+(
+    cd "$UPDATE_STAGE"
+    shasum -a 256 core/claude-switch.sh core/stun-probe.py core/desktop-update.py \
+        daemons/claude-bodyguard.sh daemons/tz-watchdog.sh daemons/bodyguard-settings.py > SHA256SUMS
+)
+# zipfile 正确标记中文文件名为 UTF-8，并保存客户端解包所需的可执行权限。
+python3 -I -B - "$UPDATE_STAGE" "$UPDATE_ZIP" <<'PY'
+from pathlib import Path
+import sys
+import zipfile
+root, target = map(Path, sys.argv[1:])
+with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not (path.is_file() or path.is_dir()):
+            raise SystemExit("更新包包含不支持的文件类型，已中止")
+        archive.write(path, path.relative_to(root).as_posix())
+PY
+
 echo "==> 生成 installer kit"
 KIT_ROOT="$WORK/$KIT_NAME"
 mkdir -p "$KIT_ROOT"
@@ -143,7 +169,7 @@ done
 mkdir -p "$KIT_ROOT/assets" "$KIT_ROOT/docs"
 mkdir -p "$KIT_ROOT/docs/images"
 mkdir -p "$KIT_ROOT/scripts"
-cp "$ROOT/scripts/build-macos-widget.sh" "$ROOT/scripts/package-macos.sh" "$KIT_ROOT/scripts/"
+cp "$ROOT/scripts/build-macos-widget.sh" "$ROOT/scripts/package-macos.sh" "$ROOT/scripts/verify-macos-update.py" "$KIT_ROOT/scripts/"
 cp "$ROOT/docs/MACOS-WIDGET.md" "$ROOT/docs/MACOS-UPDATES.md" "$KIT_ROOT/docs/"
 cp "$ROOT/assets/icon-2048.png" "$KIT_ROOT/assets/"
 cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
@@ -162,7 +188,7 @@ ditto -c -k --keepParent --norsrc --noextattr "$KIT_ROOT" "$KIT_ZIP"
 
 echo ""
 echo "✓ 打包完成:"
-for FILE in "$ZIP" "$DMG" "$KIT_ZIP"; do
+for FILE in "$ZIP" "$DMG" "$UPDATE_ZIP" "$KIT_ZIP"; do
     [ -f "$FILE" ] || { echo "✗ 缺少产物 $FILE" >&2; exit 1; }
     printf '  %-58s %8s\n' "$(basename "$FILE")" "$(du -h "$FILE" | cut -f1)"
 done

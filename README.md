@@ -2,14 +2,14 @@
 
 # Claude 切换器
 
-[English](README.en.md) · [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
+[English](README.en.md) · [Releases](https://github.com/chenchao19934/claude-switcher/releases/latest)
 
 **Fail-Closed 账号环境管理器 —— 把真实 IP 泄漏拦截在启动之前**
 
 > 🛠️ **本项目持续活跃更新中**——防护项随目标平台风控演进不断增加，见下方[路线图](#路线图)。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/YOURSJEYO/claude-switcher?label=release&color=blue)](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
+[![Release](https://img.shields.io/github/v/release/chenchao19934/claude-switcher?label=release&color=blue)](https://github.com/chenchao19934/claude-switcher/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-macOS-blue.svg)]()
 [![Windows](https://img.shields.io/badge/Windows-Beta-lightgrey.svg)](windows/)
 [![Linux](https://img.shields.io/badge/Linux-Beta-lightgrey.svg)](linux/)
@@ -111,19 +111,22 @@ macOS 版采用快捷启动面板：点击菜单栏状态，或按默认 `⌃⌥
 
 ### 直接下载（推荐）
 
-到 [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest) 下载最新版本，按用途选择：
+正式版本发布后，可到本维护仓库的 [Releases](https://github.com/chenchao19934/claude-switcher/releases/latest) 下载，按用途选择：
 
 - `ClaudeSwitcher-<版本>-installer-kit.zip`：**首次安装推荐**。解压后双击 `installer/安装.command`，安装核心脚本、守护进程与桌面 App。
-- `ClaudeSwitcher-<版本>-macos-arm64-app-only.dmg` / `.zip`：**仅包含界面 App**（不含核心脚本）；已安装核心脚本时可用于替换旧版界面。首次安装请用上面的 installer-kit。
+- `ClaudeSwitcher-<版本>-macos-<arm64|x86_64>-app-only.dmg` / `.zip`：**仅包含界面 App**（不含核心脚本）；已安装核心脚本时可用于替换旧版界面。首次安装请用上面的 installer-kit。
+- `ClaudeSwitcher-<版本>-macos-<arm64|x86_64>-update.zip`：供新版客户端更新页使用，包含 CI 预编译的 App、核心、探针、更新组件、版本及校验清单。
 - `ClaudeSwitcher-<版本>-windows.zip` / `ClaudeSwitcher-<版本>-linux.tar.gz`：Windows / Linux 脚本包（Beta），说明见各自目录的 README。
 
-> macOS 产物为 ad-hoc 签名、未公证。首次打开若被 Gatekeeper 拦截，请右键打开，或在「系统设置 → 隐私与安全性」中放行。每个 Release 附带 `SHA256SUMS-release.txt`，可用 `shasum -a 256 -c` 校验下载文件。
+> 发布流程默认生成 ad-hoc 签名、未公证的 macOS 产物。首次打开若被 Gatekeeper 拦截，请右键打开，或在「系统设置 → 隐私与安全性」中放行。每个 Release 附带 `SHA256SUMS-release.txt`，可用 `shasum -a 256 -c` 校验下载文件。
 
 ### 从源码安装
 
+首次安装器会在本机编译 App，需要 Python 3 和 Xcode 命令行工具。安装完成后的正式 Release 更新使用 CI 预编译 App，不再需要本机编译工具。
+
 ```bash
 # 克隆后双击 installer/安装.command 即可,自动识别代理客户端、代理组名与地区目标
-git clone https://github.com/YOURSJEYO/claude-switcher.git
+git clone https://github.com/chenchao19934/claude-switcher.git
 ```
 
 ## 地区自适应
@@ -178,11 +181,15 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 ### 界面内更新
 
-在「版本更新」点击「重新检查」，发现新版后点击「更新并重启」并确认。切换器会下载同一提交的源码和 SHA256 清单，校验后在本机编译 App、保留五项地区／代理配置，完成完整安全检查，再备份替换 App、核心脚本及 STUN 探针。新版 App 必须确认启动；替换或启动失败时恢复旧版本。账号存档、检查设置、代理配置和 root 守护组件不参与替换。
+页面分别展示当前安装版本和 GitHub 最新正式版本。「重新检查」只获取 Release 元数据与版本号；确认「更新并重启」后才下载安装包并校验。获取失败和尚未发布会分别显示，不会把旧结果当作最新版本。
 
-检查版本只读，不执行安装；下载优先使用已有代理环境，否则读取 macOS 已启用的系统代理，失败会区分 HTTP、TLS 和超时等原因。更新源固定为本维护仓库 `chenchao19934/claude-switcher` 的 `main`，界面和图标单独改动也会被识别。需要 Xcode 命令行工具以及属于当前用户、可写且位于同一磁盘的安装位置；带正式签名／Widget 的版本须使用对应签名的发布包升级，不能自动降级为 ad-hoc App。
+在「版本更新」点击「重新检查」，发现新版后点击「更新并重启」并确认。客户端只读取本维护仓库 `chenchao19934/claude-switcher` 的 `releases/latest` 正式稳定版，下载同一版本、匹配本机 arm64 或 x86_64 架构的 `update.zip` 与 `SHA256SUMS-release.txt`，校验包、内部工件、版本、架构及 App 签名后暂存。App 已由 CI 编译，用户更新时无需 Xcode 命令行工具，仍需 Python 3。没有正式发布版本时显示提示，不回退到 main 源码。
 
-旧版 App 的页面没有安装更新的能力，需要先替换一次新版 App 或重新运行安装器，之后即可在界面更新。详细流程、备份和回滚边界见 [macOS 更新说明](docs/MACOS-UPDATES.md)。
+更新保留五项地区／代理配置，完成完整安全检查，再由独立用户态进程备份替换 App、核心脚本及 STUN 探针，App 内置更新组件随 App 一起升级。替换后重新审计，新版 App 必须确认启动；替换、审计或启动失败时恢复旧版本。账号存档、检查设置、代理配置和 root 守护组件不参与替换，守护模板差异只读提示。
+
+检查版本只读，不执行安装；下载优先使用已有代理环境，否则读取 macOS 已启用的系统代理，失败会区分 HTTP、TLS 和超时等原因。界面按正式语义版本号识别新版，只有界面变化也应发布新版本。安装位置须属于当前用户、可写、无符号链接且位于同一磁盘；正式签名／Widget 版本须使用相同签名的专用渠道，当前通用流程会拒绝替换。
+
+旧版 App 的页面没有安装更新的能力，需要先替换一次新版引导 App 或重新运行安装器，之后即可在界面更新。终端 `update` 仍只更新核心、探针及用户态更新组件，不改变 GUI 版本。完整的发布、暂存和回滚边界见 [macOS 更新说明](docs/MACOS-UPDATES.md)。CI 首次正式发布和真实安装态更新仍需实际验收，仓库测试不能代替它们。
 
 ### 后台保镖巡检周期
 
@@ -428,7 +435,8 @@ WEBRTC_POLICY=proxy ~/.local/bin/claude-switch.sh fix
 │   └── StatusWidget.swift  # WidgetKit 状态小组件（需团队签名）
 ├── core/
 │   ├── claude-switch.sh    # 核心逻辑:审计/切换/修复
-│   └── stun-probe.py       # STUN 探针(手工协议实现)
+│   ├── stun-probe.py       # STUN 探针(手工协议实现)
+│   └── desktop-update.py   # 正式 Release 校验、用户态更新事务与回滚
 ├── windows/                # Windows 版(PowerShell 核心 + WPF 界面, Beta)
 ├── linux/                  # Linux 版(bash 核心 + systemd 保镖 + 终端菜单, Beta)
 ├── docs/                   # Web 版环境检测页(index.html 等, GitHub Pages 从这里发布) + 项目文档
@@ -439,7 +447,7 @@ WEBRTC_POLICY=proxy ~/.local/bin/claude-switch.sh fix
 │   ├── package-macos.sh    # App / ZIP / DMG / 安装包构建
 │   ├── build-macos-widget.sh # 小组件编译、签名与嵌入
 │   └── gen-sums.sh         # 重新生成 SHA256SUMS(改动 core/daemons/installer 后必跑)
-├── SHA256SUMS              # 发布工件完整性校验清单(自动更新逐项比对)
+├── SHA256SUMS              # 仓库工件校验清单(CI 打包前验证)
 └── assets/                 # 程序生成图标
 ```
 

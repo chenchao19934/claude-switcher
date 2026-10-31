@@ -1,52 +1,120 @@
 name: release
 
-on:
+"on":
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish
-    runs-on: macos-15
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Resolve version from tag
         id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          case "$VERSION" in
-            ''|*[!0-9A-Za-z._-]*)
-              echo "::error::tag must look like v1.2.3"
-              exit 1
-              ;;
-          esac
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          SEMVER='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$RELEASE_TAG" =~ $SEMVER ]]; then
+            echo "::error::Release tag must be vMAJOR.MINOR.PATCH without leading zeroes"
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify release commit
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yml
+
+  macos:
+    name: Build macOS ${{ matrix.arch }}
+    needs: [validate, verify]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
 
       - name: Verify source checksums
         run: shasum -a 256 -c SHA256SUMS
 
-      - name: Package macOS app and installer kit
-        run: |
-          bash -n scripts/package-macos.sh
-          bash scripts/package-macos.sh "$VERSION"
-
-      - name: Verify Info.plist version
+      - name: Package macOS release assets
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          bash -n scripts/package-macos.sh
+          bash scripts/package-macos.sh "$VERSION"
           PLIST="build/Claude切换器.app/Contents/Info.plist"
           test "$(plutil -extract CFBundleShortVersionString raw "$PLIST")" = "$VERSION"
           test "$(plutil -extract CFBundleVersion raw "$PLIST")" = "$VERSION"
+          test "$(lipo -archs build/Claude切换器.app/Contents/MacOS/ClaudeSwitcher)" = "$EXPECTED_ARCH"
+          unzip -tq "build/ClaudeSwitcher-${VERSION}-macos-${EXPECTED_ARCH}-update.zip"
+          python3 -I -B scripts/verify-macos-update.py "build/ClaudeSwitcher-${VERSION}-macos-${EXPECTED_ARCH}-update.zip"
+
+      - name: Upload architecture assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            build/ClaudeSwitcher-${{ env.VERSION }}-macos-${{ matrix.arch }}-app-only.zip
+            build/ClaudeSwitcher-${{ env.VERSION }}-macos-${{ matrix.arch }}-app-only.dmg
+            build/ClaudeSwitcher-${{ env.VERSION }}-macos-${{ matrix.arch }}-update.zip
+
+      - name: Upload installer kit once
+        if: matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-installer-kit
+          if-no-files-found: error
+          path: build/ClaudeSwitcher-${{ env.VERSION }}-installer-kit.zip
+
+  publish:
+    name: Publish complete release
+    needs: [validate, verify, macos]
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+
+      - name: Download all macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: build
 
       - name: Package Windows and Linux scripts
         run: |
@@ -75,31 +143,35 @@ jobs:
         run: |
           set -euo pipefail
           cd build
-          shasum -a 256 \
-            "ClaudeSwitcher-${VERSION}-macos-arm64-app-only.zip" \
-            "ClaudeSwitcher-${VERSION}-macos-arm64-app-only.dmg" \
-            "ClaudeSwitcher-${VERSION}-installer-kit.zip" \
-            "ClaudeSwitcher-${VERSION}-windows.zip" \
-            "ClaudeSwitcher-${VERSION}-linux.tar.gz" \
-            > SHA256SUMS-release.txt
-          cat SHA256SUMS-release.txt
+          ASSETS=(
+            "ClaudeSwitcher-${VERSION}-macos-arm64-app-only.zip"
+            "ClaudeSwitcher-${VERSION}-macos-arm64-app-only.dmg"
+            "ClaudeSwitcher-${VERSION}-macos-arm64-update.zip"
+            "ClaudeSwitcher-${VERSION}-macos-x86_64-app-only.zip"
+            "ClaudeSwitcher-${VERSION}-macos-x86_64-app-only.dmg"
+            "ClaudeSwitcher-${VERSION}-macos-x86_64-update.zip"
+            "ClaudeSwitcher-${VERSION}-installer-kit.zip"
+            "ClaudeSwitcher-${VERSION}-windows.zip"
+            "ClaudeSwitcher-${VERSION}-linux.tar.gz"
+          )
+          for ASSET in "${ASSETS[@]}"; do
+            test -s "$ASSET" || { echo "::error::A required release asset is missing or empty"; exit 1; }
+          done
+          shasum -a 256 "${ASSETS[@]}" > SHA256SUMS-release.txt
+          shasum -a 256 -c SHA256SUMS-release.txt
 
-      - name: Publish release
+      - name: Publish release once
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          ASSETS=(
-            "build/ClaudeSwitcher-${VERSION}-macos-arm64-app-only.zip"
-            "build/ClaudeSwitcher-${VERSION}-macos-arm64-app-only.dmg"
-            "build/ClaudeSwitcher-${VERSION}-installer-kit.zip"
-            "build/ClaudeSwitcher-${VERSION}-windows.zip"
-            "build/ClaudeSwitcher-${VERSION}-linux.tar.gz"
-            "build/SHA256SUMS-release.txt"
-          )
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${ASSETS[@]}" --clobber
-          else
-            gh release create "$TAG" "${ASSETS[@]}" \
-              --generate-notes \
-              --title "Claude 切换器 ${VERSION}"
-          fi
+          ASSETS=()
+          while read -r SUM FILE; do
+            [[ "$SUM" =~ ^[0-9a-f]{64}$ ]]
+            test "$FILE" = "$(basename "$FILE")"
+            test -f "build/$FILE"
+            ASSETS+=("build/$FILE")
+          done < build/SHA256SUMS-release.txt
+          test "${#ASSETS[@]}" -eq 9
+          ASSETS+=("build/SHA256SUMS-release.txt")
+          # Existing versions fail here; never replace published assets or create a tag.
+          gh release create "$RELEASE_TAG" "${ASSETS[@]}" \
+            --verify-tag --generate-notes --title "Claude 切换器 ${VERSION}"
