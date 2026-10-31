@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$ROOT/build/dev"
 BINARY="$BUILD/MenuBarFixture"
+APP="$BUILD/ClaudeSwitcherDemo.app"
 FAKE_CORE="$ROOT/tests/fixtures/macos-dev-core.sh"
 
 usage() {
@@ -12,8 +13,9 @@ usage() {
 用法：bash scripts/dev-macos.sh <命令>
   doctor             检查 macOS 开发工具（不联网）
   build              编译隔离 UI 演示到 build/dev/MenuBarFixture
-  run [--dark]       重新编译并启动隔离 UI 演示（假数据）
+  run [--dark] [--hotkey]  重新编译并启动隔离 UI（--hotkey 注册本次进程快捷键）
   test               运行仓库现有隔离回归
+  widget             仅编译原生通知中心小组件（不安装）
   package [版本号]   构建正式 App、ZIP、DMG 和安装包到 build/
 EOF
 }
@@ -44,6 +46,22 @@ build_demo() {
         -module-cache-path "$BUILD/module-cache" \
         "$ROOT/app/main.swift" "$ROOT/tests/MenuBarFixture.swift" \
         -o "$BINARY" -framework SwiftUI -framework AppKit
+    mkdir -p "$APP/Contents/MacOS"
+    cp "$BINARY" "$APP/Contents/MacOS/MenuBarFixture"
+    python3 - "$APP/Contents/Info.plist" <<'PY'
+import plistlib
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(plistlib.dumps({
+    "CFBundleIdentifier": "local.claude-switcher.demo",
+    "CFBundleExecutable": "MenuBarFixture",
+    "CFBundleName": "Claude 切换器隔离演示",
+    "CFBundlePackageType": "APPL",
+    "LSMinimumSystemVersion": "13.0",
+    "LSUIElement": True,
+}))
+PY
+    codesign --force -s - "$APP" >/dev/null 2>&1
     echo "隔离演示已构建：$BINARY"
 }
 
@@ -70,19 +88,23 @@ case "$COMMAND" in
         build_demo
         ;;
     run)
-        if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != --dark ]; }; then
-            usage >&2
-            exit 2
-        fi
+        for option in "$@"; do
+            case "$option" in --dark|--hotkey) ;; *) usage >&2; exit 2 ;; esac
+        done
         build_demo
         echo "正在启动隔离演示，所有检查均为假数据；从盾牌菜单退出后可重新构建。"
-        exec "$BINARY" "$FAKE_CORE" "$@"
+        exec "$APP/Contents/MacOS/MenuBarFixture" "$FAKE_CORE" "$@"
         ;;
     test)
         [ "$#" -eq 0 ] || { usage >&2; exit 2; }
         require_tools python3 swiftc node
         cd "$ROOT"
         exec python3 -B -m unittest discover -s tests -v
+        ;;
+    widget)
+        [ "$#" -eq 0 ] || { usage >&2; exit 2; }
+        require_tools swiftc python3 codesign plutil ditto
+        exec /bin/bash "$ROOT/scripts/build-macos-widget.sh" --compile-only
         ;;
     package)
         [ "$#" -le 1 ] || { usage >&2; exit 2; }

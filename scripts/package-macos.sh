@@ -74,6 +74,10 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>LSUIElement</key><true/>
+	<key>CFBundleURLTypes</key><array><dict>
+		<key>CFBundleURLName</key><string>local.claude-switcher</string>
+		<key>CFBundleURLSchemes</key><array><string>claude-switcher</string></array>
+	</dict></array>
 </dict>
 </plist>
 EOF
@@ -83,6 +87,16 @@ if codesign --force --deep -s - "$APP" >/dev/null 2>&1; then
     echo "✓ ad-hoc 签名完成"
 else
     echo "⚠️ ad-hoc 签名失败，继续打包"
+fi
+
+# 提供真实签名身份时，将原生 Widget 一并嵌入，再生成 ZIP / DMG。
+if [ -n "${WIDGET_SIGN_IDENTITY:-}" ] || [ -n "${WIDGET_APP_GROUP:-}" ]; then
+    if [ -z "${WIDGET_SIGN_IDENTITY:-}" ] || [ -z "${WIDGET_APP_GROUP:-}" ]; then
+        echo "✗ 小组件构建需要同时设置 WIDGET_SIGN_IDENTITY 和 WIDGET_APP_GROUP" >&2
+        exit 1
+    fi
+    bash "$ROOT/scripts/build-macos-widget.sh" --embed "$APP" \
+        --identity "$WIDGET_SIGN_IDENTITY" --app-group "$WIDGET_APP_GROUP"
 fi
 
 NOTE="$WORK/安装说明.txt"
@@ -121,6 +135,9 @@ for DIR in core daemons installer app; do
     ditto "$ROOT/$DIR" "$KIT_ROOT/$DIR"
 done
 mkdir -p "$KIT_ROOT/assets" "$KIT_ROOT/docs"
+mkdir -p "$KIT_ROOT/scripts"
+cp "$ROOT/scripts/build-macos-widget.sh" "$ROOT/scripts/package-macos.sh" "$KIT_ROOT/scripts/"
+cp "$ROOT/docs/MACOS-WIDGET.md" "$KIT_ROOT/docs/"
 cp "$ROOT/assets/icon-2048.png" "$KIT_ROOT/assets/"
 cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
 chmod +x "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command"

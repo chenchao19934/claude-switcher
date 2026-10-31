@@ -57,6 +57,9 @@ jobs:
       - name: Verify checksums
         run: shasum -a 256 -c SHA256SUMS
 
+      - name: Widget extension strict build
+        run: bash scripts/build-macos-widget.sh --compile-only
+
       - name: JavaScript syntax
         run: node --check docs/app.js
 

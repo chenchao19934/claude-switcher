@@ -16,6 +16,11 @@ SCENARIOS = (
     "nonzero_switch", "timeout_switch", "busy_guard", "fix_guard", "failed_fix",
     "checking_allows_quit", "hide_after_success", "reopen_cancels_hide",
     "window_lifecycle", "termination_guard",
+    "panel_toggle_no_audit", "panel_menu_recheck", "panel_idle_deactivation", "panel_busy_deactivation",
+    "panel_settings_recording_guard", "panel_child_sheet_guard", "panel_busy_close",
+    "panel_url_open_only", "shortcut_preferences", "shortcut_invalid_rejected",
+    "shortcut_press_gate", "panel_shortcut_protection", "panel_shortcut_busy_toggle",
+    "snapshot_status_semantics", "snapshot_privacy",
 )
 
 

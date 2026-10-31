@@ -8,7 +8,8 @@ final class FixtureDelegate: AppDelegate {
               FileManager.default.fileExists(atPath: CommandLine.arguments[1]) else {
             fatalError("隔离演示需要显式传入 fake-core.sh 路径")
         }
-        super.init(vm: VM(core: CommandLine.arguments[1]))
+        super.init(vm: VM(core: CommandLine.arguments[1]),
+                   enableSystemIntegration: CommandLine.arguments.contains("--hotkey"))
     }
 
     override func applicationDidFinishLaunching(_ notification: Notification) {
@@ -35,6 +36,18 @@ final class FixtureDelegate: AppDelegate {
         }
     }
 
+    override func togglePanel() {
+        super.togglePanel()
+        print("DEMO toggle panel visible: \(mainWindow?.isVisible == true)")
+        fflush(stdout)
+    }
+
+    override func hidePanel() {
+        super.hidePanel()
+        print("DEMO hide panel visible: \(mainWindow?.isVisible == true)")
+        fflush(stdout)
+    }
+
     private static func statusButtons(in view: NSView?) -> [NSStatusBarButton] {
         guard let view = view else { return [] }
         return (view as? NSStatusBarButton).map { [$0] } ?? view.subviews.flatMap { statusButtons(in: $0) }
@@ -48,7 +61,7 @@ struct MenuBarFixture: App {
     var body: some Scene {
         SwitcherMenu(vm: appDelegate.vm, controller: appDelegate)
             .commands {
-                // 同一份生产菜单内容；供无法定位 AXExtrasMenuBar 的 UI 工具验收。
+                // 隔离演示的辅助操作入口；原生菜单栏右键菜单另由 AppDelegate 管理。
                 CommandMenu("菜单内容预览") {
                     MenuBarContent(vm: appDelegate.vm, showWindow: appDelegate.showMainWindow)
                 }

@@ -1,6 +1,9 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Carbon
+import Combine
+import WidgetKit
 
 // MARK: - 模型
 
@@ -1349,71 +1352,1139 @@ struct NoticeView: View {
     }
 }
 
-// MARK: - App
 
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+// MARK: - 快捷面板
+
+private enum QuickPanelPage: String {
+    case home = "快捷面板"
+    case checks = "环境检查"
+    case settings = "检查设置"
+    case fingerprint = "设备体检"
+    case client = "代理客户端"
+    case update = "版本更新"
+    case ai = "AI 配置"
+    case about = "安全防护"
+}
+
+private enum QuickPanelAction: String, CaseIterable {
+    case check, fix, settings, fingerprint, client, update
+
+    var title: String {
+        switch self {
+        case .check: return "重新检查"
+        case .fix: return "一键修复"
+        case .settings: return "检查设置"
+        case .fingerprint: return "设备体检"
+        case .client: return "代理客户端"
+        case .update: return "检查更新"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .check: return "arrow.clockwise"
+        case .fix: return "wand.and.stars"
+        case .settings: return "slider.horizontal.3"
+        case .fingerprint: return "waveform.path.ecg"
+        case .client: return "network"
+        case .update: return "arrow.down.circle"
+        }
+    }
+
+    var keywords: String {
+        switch self {
+        case .check: return "环境 安检 audit refresh"
+        case .fix: return "故障 修复 fix repair"
+        case .settings: return "设置 日志 诊断 代理 settings log"
+        case .fingerprint: return "指纹 字体 GPU fingerprint"
+        case .client: return "代理 节点 clash verge flclash shadowrocket sing-box surge proxy client"
+        case .update: return "版本 update version"
+        }
+    }
+}
+
+struct QuickPanelView: View {
+    @ObservedObject var vm: VM
+    let onDismiss: () -> Void
+    let shortcutSettings: AnyView
+    @State private var page = QuickPanelPage.home
+    @State private var query = ""
+    @State private var copied = false
+    @FocusState private var searchFocused: Bool
+
+    init(vm: VM, onDismiss: @escaping () -> Void, shortcutSettings: AnyView = AnyView(EmptyView())) {
+        self.vm = vm
+        self.onDismiss = onDismiss
+        self.shortcutSettings = shortcutSettings
+    }
+
+    private var term: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var matchingAccounts: [String] {
+        VM.accountLetters.filter { account in
+            if term.isEmpty { return true }
+            if term.count == 1 && "ABCD".localizedCaseInsensitiveContains(term) {
+                return account.caseInsensitiveCompare(term) == .orderedSame
+            }
+            return "账号 \(account) account \(account)".localizedCaseInsensitiveContains(term)
+        }
+    }
+    private var matchingActions: [QuickPanelAction] {
+        QuickPanelAction.allCases.filter { term.isEmpty || ($0.title + " " + $0.keywords).localizedCaseInsensitiveContains(term) }
+    }
+    private var matchingChecks: [CheckRow] {
+        vm.rows.filter { term.isEmpty || ($0.name + " " + $0.detail).localizedCaseInsensitiveContains(term) }
+    }
+    private var summaryColor: Color {
+        if vm.phase == .failed { return ClaudeTheme.error }
+        if vm.isBusy { return ClaudeTheme.terracottaDeep }
+        if vm.rows.contains(where: { $0.state == .warn }) { return ClaudeTheme.warning }
+        if vm.rows.contains(where: { $0.state == .skip }) { return ClaudeTheme.muted }
+        return vm.lastCheckSummary == "通过" ? ClaudeTheme.success : ClaudeTheme.muted
+    }
+    private var summaryIcon: String {
+        if vm.phase == .failed { return "exclamationmark.shield.fill" }
+        if vm.isBusy { return "arrow.triangle.2.circlepath" }
+        if vm.rows.contains(where: { $0.state == .warn }) { return "exclamationmark.triangle.fill" }
+        if vm.rows.contains(where: { $0.state == .skip }) { return "minus.circle" }
+        return vm.lastCheckSummary == "通过" ? "checkmark.shield.fill" : "clock"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            searchHeader
+            Divider().overlay(ClaudeTheme.cardBorder)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    if page == .home { homeContent }
+                    else { detailContent }
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            footer
+        }
+        .frame(width: 760, height: 560)
+        .background(ClaudeTheme.bgTop)
+        .clipShape(RoundedRectangle(cornerRadius: 22))
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(ClaudeTheme.cardBorder, lineWidth: 1))
+        .preferredColorScheme(.light)
+        .onAppear {
+            searchFocused = true
+            consumeNavigationRequest()
+        }
+        .onChange(of: vm.showSettingsSheet) { _ in consumeNavigationRequest() }
+        .onChange(of: vm.showUpdateSheet) { _ in consumeNavigationRequest() }
+        .onChange(of: page) { _ in copied = false }
+        .onExitCommand {
+            if page == .home { onDismiss() }
+            else { show(.home) }
+        }
+    }
+
+    private var searchHeader: some View {
+        HStack(spacing: 14) {
+            if page == .home {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 20, weight: .regular))
+                    .foregroundColor(ClaudeTheme.muted)
+                    .frame(width: 26, height: 32)
+                    .accessibilityHidden(true)
+            } else {
+                Button { show(.home) } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 20, weight: .regular))
+                        .foregroundColor(ClaudeTheme.muted)
+                        .frame(width: 26, height: 32)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("返回快捷面板")
+            }
+            if page == .home {
+                TextField("搜索账号、检查或操作…", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 23, weight: .regular))
+                    .focused($searchFocused)
+                    .onSubmit { performSearchResult() }
+                    .accessibilityLabel("搜索账号、检查或操作")
+            } else {
+                Text(page.rawValue)
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(ClaudeTheme.ink)
+                Spacer()
+            }
+            Button(action: onDismiss) {
+                Text("esc").font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(ClaudeTheme.muted)
+                    .padding(.horizontal, 7).padding(.vertical, 5)
+                    .background(ClaudeTheme.iconWell)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+            }
+            .buttonStyle(.plain)
+            .help("收起快捷面板")
+            .accessibilityLabel("收起快捷面板")
+        }
+        .padding(.horizontal, 25).padding(.vertical, 20)
+    }
+
+    private var homeContent: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            summaryCard
+            if !vm.banner.isEmpty || !vm.note.isEmpty { operationMessage }
+            if vm.coreMissing { missingCore }
+            if !matchingAccounts.isEmpty {
+                sectionHeading("切换账号", detail: "每次切换前重新完成安全检查")
+                HStack(spacing: 12) {
+                    ForEach(matchingAccounts, id: \.self) { account in accountButton(account) }
+                }
+            }
+            if !matchingActions.isEmpty {
+                sectionHeading(term.isEmpty ? "常用操作" : "匹配操作", detail: "")
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 6), spacing: 10) {
+                    ForEach(matchingActions, id: \.self) { action in actionButton(action) }
+                }
+            }
+            if term.isEmpty {
+                Button { show(.checks) } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "list.bullet.clipboard").foregroundColor(ClaudeTheme.terracottaDeep)
+                        Text("查看 14 项检查").foregroundColor(ClaudeTheme.ink)
+                        Spacer()
+                        checkDots
+                        Image(systemName: "chevron.right").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .padding(14)
+                    .background(ClaudeTheme.card)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(ClaudeTheme.cardBorder))
+                }
+                .buttonStyle(.plain)
+            } else if !matchingChecks.isEmpty {
+                sectionHeading("匹配检查", detail: "\(matchingChecks.count) 项")
+                checksGrid(matchingChecks)
+            }
+            if !term.isEmpty && matchingAccounts.isEmpty && matchingActions.isEmpty && matchingChecks.isEmpty {
+                VStack(spacing: 9) {
+                    Image(systemName: "magnifyingglass").font(.title2)
+                    Text("没有找到“\(term)”").font(.callout)
+                    Text("试试账号 A、DNS、设置或更新").font(.caption)
+                }
+                .foregroundColor(ClaudeTheme.muted)
+                .frame(maxWidth: .infinity).padding(.vertical, 20)
+            }
+        }
+    }
+
+    private var summaryCard: some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 13).fill(summaryColor.opacity(0.1))
+                if vm.isBusy { ProgressView().scaleEffect(0.8) }
+                else { Image(systemName: summaryIcon).font(.system(size: 24, weight: .regular)).foregroundColor(summaryColor) }
+            }
+            .frame(width: 52, height: 52)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Text("Claude 切换器").font(.system(size: 17, weight: .semibold, design: .serif))
+                    Text("账号 \(vm.current)")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(ClaudeTheme.terracottaTint).clipShape(Capsule())
+                        .foregroundColor(ClaudeTheme.terracottaDeep)
+                }
+                Text("最近检查 · \(vm.lastCheckSummary)")
+                    .font(.system(size: 12)).foregroundColor(summaryColor)
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 6) {
+                Text("\(vm.rows.filter { $0.state == .ok }.count) / 14")
+                    .font(.system(size: 23, weight: .light, design: .rounded))
+                    .monospacedDigit().foregroundColor(ClaudeTheme.ink)
+                Text(checkCountText).font(.system(size: 10)).foregroundColor(ClaudeTheme.muted)
+            }
+        }
+        .foregroundColor(ClaudeTheme.ink)
+    }
+
+    private var checkCountText: String {
+        let warnings = vm.rows.filter { $0.state == .warn }.count
+        let skipped = vm.rows.filter { $0.state == .skip }.count
+        let failures = vm.rows.filter { $0.state == .fail }.count
+        let pending = vm.rows.filter { $0.state == .pending }.count
+        if pending == vm.rows.count { return "等待检查" }
+        var parts: [String] = []
+        if pending > 0 { parts.append("\(pending) 项待检查") }
+        if failures > 0 { parts.append("\(failures) 项失败") }
+        if warnings > 0 { parts.append("\(warnings) 项警告") }
+        if skipped > 0 { parts.append("\(skipped) 项跳过") }
+        return parts.isEmpty ? "全部检查通过" : parts.joined(separator: " · ")
+    }
+
+    private var checkDots: some View {
+        HStack(spacing: 4) {
+            ForEach(vm.rows) { row in
+                Circle().fill(color(row.state)).frame(width: 5, height: 5)
+                    .help("\(row.name)：\(statusText(row.state))")
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("14 项检查，\(checkCountText)")
+    }
+
+    private func sectionHeading(_ title: String, detail: String) -> some View {
+        HStack {
+            Text(title).font(.system(size: 13, weight: .semibold)).foregroundColor(ClaudeTheme.ink)
+            Spacer()
+            Text(detail).font(.system(size: 10)).foregroundColor(ClaudeTheme.muted)
+        }
+        .padding(.bottom, -10)
+    }
+
+    private func accountButton(_ account: String) -> some View {
+        let active = vm.current == account
+        return Button { vm.switchTo(account) } label: {
+            HStack(spacing: 11) {
+                Text(account).font(.system(size: 22, weight: .medium, design: .rounded))
+                    .frame(width: 40, height: 43)
+                    .background(active ? Color.white.opacity(0.17) : ClaudeTheme.iconWell)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("账号 \(account)").font(.system(size: 13, weight: .semibold))
+                    Text(accountSubtitle(account))
+                        .font(.system(size: 10)).lineLimit(1)
+                        .foregroundColor(active ? Color.white.opacity(0.85) : ClaudeTheme.muted)
+                }
+                Spacer(minLength: 0)
+            }
+            .foregroundColor(active ? .white : ClaudeTheme.ink)
+            .padding(12)
+            .frame(maxWidth: .infinity)
+            .background(active ? ClaudeTheme.terracottaDeep : ClaudeTheme.card)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(active ? Color.clear : ClaudeTheme.cardBorder))
+        }
+        .buttonStyle(.plain)
+        .disabled(vm.isBusy || vm.coreMissing)
+        .accessibilityLabel("账号 \(account)，\(accountSubtitle(account))，重新检查后切换")
+        .help("完成 14 项审计后\(active ? "启动当前账号" : "切换至账号 " + account)")
+    }
+
+    private func accountSubtitle(_ account: String) -> String {
+        if vm.current == account { return "当前使用" }
+        if let stamp = vm.stamps[account] { return "已建档 · \(stamp.size)" }
+        return vm.archived.contains(account) ? "已建档" : "首次登录"
+    }
+
+    private func actionButton(_ action: QuickPanelAction) -> some View {
+        Button { perform(action) } label: {
+            VStack(spacing: 9) {
+                Image(systemName: action.icon)
+                    .font(.system(size: 20, weight: .regular))
+                    .foregroundColor(ClaudeTheme.terracottaDeep)
+                    .frame(width: 43, height: 43)
+                    .background(ClaudeTheme.terracottaTint)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                Text(action.title).font(.system(size: 11)).foregroundColor(ClaudeTheme.ink)
+            }
+            .frame(maxWidth: .infinity).padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(actionNeedsIdle(action) && vm.isBusy)
+    }
+
+    private func actionNeedsIdle(_ action: QuickPanelAction) -> Bool {
+        action == .check || action == .fix || action == .fingerprint
+    }
+
+    private func perform(_ action: QuickPanelAction) {
+        switch action {
+        case .check: vm.refresh()
+        case .fix: vm.fixAll()
+        case .settings: show(.settings)
+        case .fingerprint: show(.fingerprint); vm.inspectFingerprint()
+        case .client: show(.client)
+        case .update: show(.update); vm.checkUpdate()
+        }
+    }
+
+    private func performSearchResult() {
+        guard !term.isEmpty else { return }
+        if let account = matchingAccounts.first { vm.switchTo(account) }
+        else if let action = matchingActions.first { perform(action) }
+        else if !matchingChecks.isEmpty { show(.checks) }
+    }
+
+    private func show(_ destination: QuickPanelPage) {
+        page = destination
+        query = ""
+        searchFocused = destination == .home
+        if destination == .settings { vm.loadCheckConfig() }
+    }
+
+    private func consumeNavigationRequest() {
+        if vm.showSettingsSheet {
+            vm.showSettingsSheet = false
+            show(.settings)
+        }
+        if vm.showUpdateSheet {
+            vm.showUpdateSheet = false
+            show(.update)
+        }
+    }
+
+    @ViewBuilder private var detailContent: some View {
+        switch page {
+        case .home: EmptyView()
+        case .checks:
+            summaryCard
+            if !vm.banner.isEmpty || !vm.note.isEmpty { operationMessage }
+            checksGrid(vm.rows)
+            HStack {
+                Text("灰色跳过项不计入通过数量").font(.caption).foregroundColor(ClaudeTheme.muted)
+                Spacer()
+                Button("重新检查") { vm.refresh() }.disabled(vm.isBusy)
+                Button("一键修复") { vm.fixAll() }.disabled(vm.isBusy)
+            }
+        case .settings: settingsContent
+        case .fingerprint:
+            detailIntro("设备指纹体检", subtitle: "字体、GPU 与虚拟机特征；Canvas / WebGL 使用 Web 检测页")
+            outputBox(vm.fingerprint.isEmpty ? "尚未体检" : vm.fingerprint)
+            Button("重新体检") { vm.inspectFingerprint() }.disabled(vm.isBusy)
+        case .client:
+            detailIntro("选择代理客户端", subtitle: "切换后重新执行环境审计；不会自动安装或启动代理客户端")
+            VStack(spacing: 10) {
+                ForEach(VM.clientChoices, id: \.key) { choice in
+                    Button { vm.setClient(choice.key) } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "network").foregroundColor(ClaudeTheme.terracottaDeep)
+                            Text(choice.label).font(.system(size: 13, weight: .medium)).foregroundColor(ClaudeTheme.ink)
+                            Spacer()
+                            if vm.currentClient == choice.key {
+                                Label("当前", systemImage: "checkmark.circle.fill")
+                                    .font(.system(size: 11)).foregroundColor(ClaudeTheme.success)
+                            }
+                        }
+                        .padding(13).background(ClaudeTheme.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(ClaudeTheme.cardBorder))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(vm.isBusy || vm.isSwitchingClient || vm.coreMissing)
+                }
+            }
+            if !vm.banner.isEmpty { operationMessage }
+        case .update:
+            detailIntro("检查新版本", subtitle: "只读检查核心版本，更新前仍需确认")
+            outputBox(vm.updateText.isEmpty ? "尚未检查" : vm.updateText)
+            HStack(spacing: 12) {
+                Button("重新检查") { vm.checkUpdate() }
+                Button(copied ? "已复制" : "复制更新命令") { copy("~/.local/bin/claude-switch.sh update") }
+            }
+            Text("更新命令在终端中执行，包含 SHA256 校验、备份和失败回滚。")
+                .font(.caption).foregroundColor(ClaudeTheme.muted)
+        case .ai:
+            detailIntro("交给本地 AI 配置", subtitle: "复制提示词，按仓库 AGENTS.md 安装与排障")
+            outputBox(vm.aiPrompt)
+            Button(copied ? "已复制提示词" : "复制提示词") { copy(vm.aiPrompt) }
+        case .about:
+            detailIntro("安全防护", subtitle: "14 项环境审计与独立守护进程协同工作")
+            ForEach(Array(NoticeView().sections.enumerated()), id: \.offset) { _, section in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(section.0).font(.system(size: 13, weight: .semibold)).foregroundColor(ClaudeTheme.ink)
+                    Text(section.1).font(.system(size: 11)).foregroundColor(ClaudeTheme.muted).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var settingsContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            detailIntro("检查偏好", subtitle: "只允许自定义以下六项非关键检查；硬性安全项始终执行")
+            shortcutSettings
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 13) {
+                ForEach(VM.optionalChecks, id: \.key) { item in
+                    Toggle(item.label, isOn: Binding(
+                        get: { !vm.disabledChecks.contains(item.key) },
+                        set: { enabled in
+                            if enabled { vm.disabledChecks.remove(item.key) }
+                            else { vm.disabledChecks.insert(item.key) }
+                        }
+                    ))
+                    .toggleStyle(.switch).controlSize(.small)
+                    .font(.system(size: 12))
+                }
+            }
+            .padding(16).background(ClaudeTheme.card).clipShape(RoundedRectangle(cornerRadius: 12))
+            .disabled(vm.settingsBusy)
+            VStack(alignment: .leading, spacing: 13) {
+                Toggle("将上述非关键项的失败降为警告", isOn: $vm.allowOptionalFailures)
+                Toggle("记录脱敏客户端日志", isOn: $vm.loggingEnabled)
+            }
+            .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+            .disabled(vm.settingsBusy)
+            HStack {
+                Text("代理客户端").font(.system(size: 12))
+                Spacer()
+                Picker("代理客户端", selection: Binding(get: { vm.currentClient }, set: { vm.setClient($0) })) {
+                    if vm.currentClient.isEmpty { Text("尚未读取").tag("") }
+                    ForEach(VM.clientChoices, id: \.key) { choice in Text(choice.label).tag(choice.key) }
+                }
+                .labelsHidden().frame(width: 180).disabled(vm.isBusy || vm.isSwitchingClient)
+            }
+            if !vm.settingsMessage.isEmpty {
+                Text(vm.settingsMessage).font(.caption).foregroundColor(ClaudeTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 12) {
+                Button("恢复默认") { vm.restoreCheckDefaults() }.disabled(vm.settingsBusy)
+                Button("导出诊断…") { vm.exportDiagnostics() }.disabled(vm.settingsBusy)
+                Spacer()
+                if vm.settingsBusy { ProgressView().scaleEffect(0.65).frame(width: 18) }
+                Button("保存并重新检查") { vm.saveCheckConfig() }
+                    .buttonStyle(.borderedProminent).tint(ClaudeTheme.terracottaDeep)
+                    .disabled(vm.settingsBusy || vm.isBusy)
+            }
+        }
+        .foregroundColor(ClaudeTheme.ink)
+    }
+
+    private func detailIntro(_ title: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.system(size: 18, weight: .semibold, design: .serif)).foregroundColor(ClaudeTheme.ink)
+            Text(subtitle).font(.system(size: 11)).foregroundColor(ClaudeTheme.muted)
+        }
+    }
+
+    private func outputBox(_ text: String) -> some View {
+        Text(text).font(.system(size: 11, design: .monospaced))
+            .foregroundColor(ClaudeTheme.ink).textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16).background(ClaudeTheme.card)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(ClaudeTheme.cardBorder))
+    }
+
+    private func checksGrid(_ rows: [CheckRow]) -> some View {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 9) {
+            ForEach(rows) { row in
+                HStack(spacing: 9) {
+                    Image(systemName: row.icon).font(.system(size: 12)).foregroundColor(ClaudeTheme.muted)
+                        .frame(width: 18)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 5) {
+                            Text(row.name).font(.system(size: 11, weight: .medium)).foregroundColor(ClaudeTheme.ink)
+                            Spacer(minLength: 0)
+                            Text(statusText(row.state)).font(.system(size: 9, weight: .medium)).foregroundColor(color(row.state))
+                        }
+                        Text(row.detail.isEmpty ? "等待检查" : row.detail)
+                            .font(.system(size: 10)).foregroundColor(ClaudeTheme.muted)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    Image(systemName: stateSymbol(row.state)).font(.system(size: 12)).foregroundColor(color(row.state))
+                }
+                .padding(10).background(ClaudeTheme.card).clipShape(RoundedRectangle(cornerRadius: 10))
+                .help(row.detail)
+                .accessibilityElement(children: .combine)
+            }
+        }
+    }
+
+    private var operationMessage: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if !vm.banner.isEmpty { Text(vm.banner).font(.system(size: 12, weight: .medium)) }
+            if !vm.note.isEmpty { Text(vm.note).font(.system(size: 11)) }
+        }
+        .foregroundColor(vm.phase == .failed ? ClaudeTheme.error : ClaudeTheme.terracottaDeep)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12).background(ClaudeTheme.terracottaTint).clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var missingCore: some View {
+        HStack {
+            Text("安装核心后即可执行检查与账号切换").font(.system(size: 12)).foregroundColor(ClaudeTheme.muted)
+            Spacer()
+            Link("安装说明 ↗", destination: URL(string: "https://github.com/YOURSJEYO/claude-switcher#安装")!)
+                .font(.system(size: 12)).foregroundColor(ClaudeTheme.terracottaDeep)
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "lock.shield").font(.system(size: 10))
+            Text("硬性安全项必须通过 · 灰色表示已跳过").font(.system(size: 10))
+            Spacer()
+            Button("AI 配置") { show(.ai) }
+                .buttonStyle(.plain).font(.system(size: 10))
+            Button { show(.about) } label: {
+                Image(systemName: "info.circle").font(.system(size: 12))
+            }
+            .buttonStyle(.plain).help("安全防护说明").accessibilityLabel("安全防护说明")
+            if page != .home {
+                Button("返回首页") { show(.home) }.buttonStyle(.plain).font(.system(size: 10))
+            }
+        }
+        .foregroundColor(ClaudeTheme.muted)
+        .padding(.horizontal, 24).padding(.vertical, 13)
+        .background(ClaudeTheme.iconWell.opacity(0.7))
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        _ = NSPasteboard.general.setString(text, forType: .string)
+        copied = true
+    }
+
+    private func color(_ state: RowState) -> Color {
+        switch state {
+        case .pending, .skip: return ClaudeTheme.muted
+        case .ok: return ClaudeTheme.success
+        case .warn: return ClaudeTheme.warning
+        case .fail: return ClaudeTheme.error
+        }
+    }
+
+    private func statusText(_ state: RowState) -> String {
+        switch state {
+        case .pending: return "待检查"
+        case .ok: return "通过"
+        case .warn: return "警告"
+        case .fail: return "失败"
+        case .skip: return "已跳过"
+        }
+    }
+
+    private func stateSymbol(_ state: RowState) -> String {
+        switch state {
+        case .pending: return "clock"
+        case .ok: return "checkmark.circle.fill"
+        case .warn: return "exclamationmark.triangle.fill"
+        case .fail: return "xmark.octagon.fill"
+        case .skip: return "minus.circle"
+        }
+    }
+}
+
+// MARK: - 呼出快捷键与展示偏好
+
+struct GlobalShortcut: Codable, Equatable {
+    let keyCode: UInt32
+    let modifiers: UInt32
+
+    static let standard = GlobalShortcut(keyCode: UInt32(kVK_Space), modifiers: UInt32(controlKey | optionKey))
+    static let modifierMask = UInt32(cmdKey | controlKey | optionKey | shiftKey)
+
+    var isValid: Bool {
+        keyCode <= 126 && keyCode != UInt32(kVK_Escape) &&
+        modifiers & ~Self.modifierMask == 0 && modifiers & UInt32(cmdKey | controlKey | optionKey) != 0
+    }
+
+    var label: String {
+        var text = ""
+        for (flag, symbol) in [(controlKey, "⌃"), (optionKey, "⌥"), (shiftKey, "⇧"), (cmdKey, "⌘")] {
+            if modifiers & UInt32(flag) != 0 { text += symbol }
+        }
+        let names: [UInt32: String] = [0:"A",1:"S",2:"D",3:"F",4:"H",5:"G",6:"Z",7:"X",8:"C",9:"V",11:"B",12:"Q",13:"W",14:"E",15:"R",16:"Y",17:"T",18:"1",19:"2",20:"3",21:"4",22:"6",23:"5",24:"=",25:"9",26:"7",27:"−",28:"8",29:"0",30:"]",31:"O",32:"U",33:"[",34:"I",35:"P",36:"Return",37:"L",38:"J",39:"'",40:"K",41:";",42:"\\",43:",",44:"/",45:"N",46:"M",47:".",48:"Tab",49:"Space",50:"`",51:"Delete",65:".",67:"*",69:"+",75:"/",76:"Enter",78:"−",81:"=",82:"0",83:"1",84:"2",85:"3",86:"4",87:"5",88:"6",89:"7",91:"8",92:"9",96:"F5",97:"F6",98:"F7",99:"F3",100:"F8",101:"F9",103:"F11",105:"F13",106:"F16",107:"F14",109:"F10",111:"F12",113:"F15",114:"Help",115:"Home",116:"Page Up",117:"⌦",118:"F4",119:"End",120:"F2",121:"Page Down",122:"F1",123:"←",124:"→",125:"↓",126:"↑"]
+        return text + (names[keyCode] ?? "Key \(keyCode)")
+    }
+
+    init(keyCode: UInt32, modifiers: UInt32) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+    }
+
+    init(event: NSEvent) {
+        keyCode = UInt32(event.keyCode)
+        var flags: UInt32 = 0
+        for (native, carbon) in [(NSEvent.ModifierFlags.command, cmdKey), (.control, controlKey), (.option, optionKey), (.shift, shiftKey)] {
+            if event.modifierFlags.contains(native) { flags |= UInt32(carbon) }
+        }
+        modifiers = flags
+    }
+}
+
+final class AppPreferences: ObservableObject {
+    @Published private(set) var shortcut: GlobalShortcut?
+    @Published var shortcutMessage = ""
+    @Published var isRecordingShortcut = false
+    var requestShortcut: ((GlobalShortcut?) -> Void)?
+    private let defaults: UserDefaults?
+
+    init(defaults: UserDefaults? = nil) {
+        self.defaults = defaults
+        if defaults?.object(forKey: "quickPanel.shortcutEnabled") != nil,
+           defaults?.bool(forKey: "quickPanel.shortcutEnabled") == false {
+            shortcut = nil
+        } else if let data = defaults?.data(forKey: "quickPanel.shortcut"),
+                  let saved = try? JSONDecoder().decode(GlobalShortcut.self, from: data), saved.isValid {
+            shortcut = saved
+        } else {
+            shortcut = .standard
+        }
+    }
+
+    func commit(_ value: GlobalShortcut?) {
+        shortcut = value
+        shortcutMessage = value.map { "已保存：\($0.label)" } ?? "快捷键已停用，仍可点击菜单栏呼出"
+        defaults?.set(value != nil, forKey: "quickPanel.shortcutEnabled")
+        if let value = value, let data = try? JSONEncoder().encode(value) {
+            defaults?.set(data, forKey: "quickPanel.shortcut")
+        } else {
+            defaults?.removeObject(forKey: "quickPanel.shortcut")
+        }
+    }
+}
+
+final class GlobalHotKey {
+    private var handler: EventHandlerRef?
+    private var registration: EventHotKeyRef?
+    private var current: GlobalShortcut?
+    var onPress: ((TimeInterval) -> Void)?
+
+    func replace(with shortcut: GlobalShortcut?) -> OSStatus {
+        if shortcut == current { return noErr }
+        guard let shortcut = shortcut else {
+            if let registration = registration { UnregisterEventHotKey(registration) }
+            registration = nil; current = nil
+            return noErr
+        }
+        guard shortcut.isValid else { return OSStatus(paramErr) }
+        if handler == nil {
+            var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            let result = InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
+                guard let context = context, let event = event else { return OSStatus(eventNotHandledErr) }
+                var identifier = EventHotKeyID()
+                let result = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &identifier)
+                guard result == noErr, identifier.signature == 0x43535754, identifier.id == 1 else { return OSStatus(eventNotHandledErr) }
+                Unmanaged<GlobalHotKey>.fromOpaque(context).takeUnretainedValue().onPress?(GetEventTime(event))
+                return noErr
+            }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), &handler)
+            guard result == noErr else { return result }
+        }
+        // 新组合注册成功才撤销旧组合，冲突时保留原来的可用入口。
+        var replacement: EventHotKeyRef?
+        let result = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, EventHotKeyID(signature: 0x43535754, id: 1), GetApplicationEventTarget(), UInt32(kEventHotKeyExclusive), &replacement)
+        guard result == noErr else { return result }
+        if let registration = registration { UnregisterEventHotKey(registration) }
+        registration = replacement; current = shortcut
+        return noErr
+    }
+
+    deinit {
+        if let registration = registration { UnregisterEventHotKey(registration) }
+        if let handler = handler { RemoveEventHandler(handler) }
+    }
+}
+
+struct ShortcutPressGate {
+    private var lastTimestamp: TimeInterval?
+    mutating func accepts(timestamp: TimeInterval, isRepeat: Bool = false) -> Bool {
+        guard timestamp.isFinite, timestamp >= 0, !isRepeat else { return false }
+        if let last = lastTimestamp, timestamp - last < 0.15 { return false }
+        lastTimestamp = timestamp
+        return true
+    }
+}
+
+private final class ShortcutCaptureButton: NSButton {
+    var capture: ((GlobalShortcut?) -> Void)?
+    var recordingChanged: ((Bool) -> Void)?
+    var savedTitle = ""
+    private var recording = false
+    override var acceptsFirstResponder: Bool { true }
+
+    @objc func beginRecording() {
+        recording = true
+        title = "按下新组合…"
+        recordingChanged?(true)
+        window?.makeFirstResponder(self)
+    }
+
+    private func finish() {
+        recording = false
+        title = savedTitle
+        recordingChanged?(false)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        finish()
+        return super.resignFirstResponder()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard recording else { super.keyDown(with: event); return }
+        if event.keyCode == UInt16(kVK_Escape) { finish(); return }
+        if event.keyCode == UInt16(kVK_Delete) && event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty {
+            finish(); capture?(nil); return
+        }
+        let shortcut = GlobalShortcut(event: event)
+        finish()
+        capture?(shortcut)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard recording else { return super.performKeyEquivalent(with: event) }
+        keyDown(with: event)
+        return true
+    }
+}
+
+private struct ShortcutRecorder: NSViewRepresentable {
+    @ObservedObject var preferences: AppPreferences
+    func makeNSView(context: Context) -> ShortcutCaptureButton {
+        let button = ShortcutCaptureButton(title: "", target: nil, action: #selector(ShortcutCaptureButton.beginRecording))
+        button.target = button
+        button.bezelStyle = .rounded
+        button.setAccessibilityLabel("录制呼出快捷键")
+        return button
+    }
+    func updateNSView(_ button: ShortcutCaptureButton, context: Context) {
+        button.savedTitle = preferences.shortcut?.label ?? "点击录制快捷键"
+        if !preferences.isRecordingShortcut { button.title = button.savedTitle }
+        button.capture = { preferences.requestShortcut?($0) }
+        button.recordingChanged = { preferences.isRecordingShortcut = $0 }
+    }
+}
+
+struct ShortcutSettingsView: View {
+    @ObservedObject var preferences: AppPreferences
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 10) {
+                Text("快捷呼出").font(.system(size: 13, weight: .semibold))
+                Spacer()
+                ShortcutRecorder(preferences: preferences).frame(width: 170, height: 28)
+                Button("恢复默认") { preferences.requestShortcut?(.standard) }
+                    .disabled(preferences.isRecordingShortcut)
+                Button("停用") { preferences.requestShortcut?(nil) }
+                    .disabled(preferences.isRecordingShortcut || preferences.shortcut == nil)
+            }
+            Text("点击录制，按下含 ⌃ / ⌥ / ⌘ 的组合；Esc 取消，Delete 停用。更改立即保存。")
+                .font(.system(size: 11)).foregroundColor(ClaudeTheme.muted)
+            if !preferences.shortcutMessage.isEmpty {
+                Text(preferences.shortcutMessage).font(.system(size: 11)).foregroundColor(ClaudeTheme.terracottaDeep)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14).background(ClaudeTheme.card).clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - 菜单栏与 Widget 的脱敏状态
+
+struct WidgetStatusSnapshot: Codable, Equatable {
+    let schemaVersion: Int
+    let currentAccount: String
+    let status: String
+    let checkedAt: Double
+    let passed: Int
+    let warning: Int
+    let failed: Int
+    let skipped: Int
+    let pending: Int
+
+    static func capture(_ vm: VM, checkedAt: Double) -> WidgetStatusSnapshot {
+        let status: String
+        switch vm.phase {
+        case .checking: status = "checking"
+        case .ready: status = "ready"
+        case .failed: status = "failed"
+        case .fixing: status = "fixing"
+        case .switching: status = "switching"
+        case .done: status = "done"
+        }
+        let current = VM.accountLetters.contains(vm.current) ? vm.current : "none"
+        return WidgetStatusSnapshot(schemaVersion: 1, currentAccount: current, status: status,
+            checkedAt: checkedAt, passed: vm.rows.filter { $0.state == .ok }.count,
+            warning: vm.rows.filter { $0.state == .warn }.count, failed: vm.rows.filter { $0.state == .fail }.count,
+            skipped: vm.rows.filter { $0.state == .skip }.count, pending: vm.rows.filter { $0.state == .pending }.count)
+    }
+
+    var menuSummary: String {
+        if status == "checking" { return "检查中" }
+        if status == "fixing" { return "修复中" }
+        if status == "switching" { return "切换中" }
+        if status == "failed" || failed > 0 { return "未通过" }
+        if checkedAt == 0 || pending > 0 || passed + warning + failed + skipped != 14 { return "待检查" }
+        if warning > 0 { return "有警告" }
+        if skipped > 0 { return "含跳过" }
+        return "通过"
+    }
+
+    var symbol: String {
+        switch menuSummary {
+        case "未通过": return "exclamationmark.shield"
+        case "有警告": return "exclamationmark.triangle"
+        case "通过": return "checkmark.shield"
+        case "含跳过": return "minus.circle"
+        case "检查中", "修复中", "切换中": return "arrow.triangle.2.circlepath"
+        default: return "shield.lefthalf.filled"
+        }
+    }
+}
+
+final class WidgetStatusPublisher {
+    private let defaults: UserDefaults?
+    private var lastData: Data?
+    init(appGroup: String?) {
+        if let appGroup = appGroup, !appGroup.isEmpty { defaults = UserDefaults(suiteName: appGroup) }
+        else { defaults = nil }
+    }
+    func publish(_ snapshot: WidgetStatusSnapshot) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let defaults = defaults, let data = try? encoder.encode(snapshot), data != lastData else { return }
+        defaults.set(data, forKey: "statusSnapshot")
+        lastData = data
+        WidgetCenter.shared.reloadTimelines(ofKind: "ClaudeSwitcherStatusWidget")
+    }
+}
+
+private final class QuickAccessPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     let vm: VM
+    let preferences: AppPreferences
     private(set) var mainWindow: NSWindow?
+    private(set) var statusItem: NSStatusItem?
+    private let hotKey = GlobalHotKey()
+    private let enableSystemIntegration: Bool
+    private var subscriptions = Set<AnyCancellable>()
+    private var widgetPublisher: WidgetStatusPublisher?
+    private var checkedAt: Double = 0
+    private var auditInFlight = false
+    private var installedObservers = false
+    private var localEventMonitor: Any?
+    private var shortcutPressGate = ShortcutPressGate()
 
     override init() {
         vm = VM()
+        preferences = AppPreferences(defaults: .standard)
+        enableSystemIntegration = true
         super.init()
+        configurePreferences()
     }
 
-    // 隔离测试可注入假核心脚本，不需要修改 HOME 或接触真实账号。
-    init(vm: VM) {
+    // 测试默认关闭系统快捷键与共享容器写入，且不保存真实用户偏好。
+    init(vm: VM, preferences: AppPreferences = AppPreferences(), enableSystemIntegration: Bool = false) {
         self.vm = vm
+        self.preferences = preferences
+        self.enableSystemIntegration = enableSystemIntegration
         super.init()
+        configurePreferences()
+    }
+
+    private func configurePreferences() {
+        preferences.requestShortcut = { [weak self] candidate in self?.setShortcut(candidate) }
+        hotKey.onPress = { [weak self] timestamp in
+            self?.handleShortcutPress(timestamp: timestamp)
+        }
+    }
+
+    func setShortcut(_ candidate: GlobalShortcut?) {
+        guard candidate?.isValid != false else {
+            preferences.shortcutMessage = "请选择包含 Control、Option 或 Command 的有效组合"
+            return
+        }
+        if enableSystemIntegration {
+            let result = hotKey.replace(with: candidate)
+            guard result == noErr else {
+                preferences.shortcutMessage = "快捷键被系统或其他应用占用（\(result)），保留原设置；仍可点击菜单栏呼出"
+                return
+            }
+        }
+        preferences.commit(candidate)
+        updateStatusItem()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
-        vm.onSwitchCompleted = { [weak self] in self?.mainWindow?.orderOut(nil) }
+        vm.onSwitchCompleted = { [weak self] in self?.hidePanel() }
+        setupStatusItem()
+        observeModel()
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self, self.mainWindow?.isKeyWindow == true,
+                  !self.preferences.isRecordingShortcut,
+                  NSApplication.shared.modalWindow == nil, self.mainWindow?.attachedSheet == nil else { return event }
+            if event.keyCode == UInt16(kVK_Escape) {
+                self.hidePanel()
+                return nil
+            }
+            if self.preferences.shortcut == GlobalShortcut(event: event) {
+                self.handleShortcutPress(timestamp: event.timestamp, isRepeat: event.isARepeat)
+                return nil
+            }
+            return event
+        }
+        if enableSystemIntegration {
+            widgetPublisher = WidgetStatusPublisher(appGroup: Bundle.main.object(forInfoDictionaryKey: "ClaudeSwitcherAppGroup") as? String)
+            let result = hotKey.replace(with: preferences.shortcut)
+            if result != noErr { preferences.shortcutMessage = "呼出快捷键注册失败（\(result)），请在检查设置中更换；菜单栏仍可使用" }
+        }
         showMainWindow()
         vm.start()
     }
 
+    private func observeModel() {
+        guard !installedObservers else { return }
+        installedObservers = true
+        vm.$phase.receive(on: RunLoop.main).sink { [weak self] phase in
+            guard let self = self else { return }
+            if phase == .checking { self.auditInFlight = true }
+            else if self.auditInFlight {
+                self.checkedAt = Date().timeIntervalSince1970
+                self.auditInFlight = false
+            }
+        }.store(in: &subscriptions)
+        vm.objectWillChange.debounce(for: .milliseconds(80), scheduler: RunLoop.main).sink { [weak self] _ in
+            self?.updateStatusItem()
+        }.store(in: &subscriptions)
+        updateStatusItem()
+    }
+
+    private func setupStatusItem() {
+        guard statusItem == nil else { return }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.target = self
+        item.button?.action = #selector(statusClicked)
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        statusItem = item
+        updateStatusItem()
+    }
+
+    func updateStatusItem() {
+        let snapshot = WidgetStatusSnapshot.capture(vm, checkedAt: checkedAt)
+        if let button = statusItem?.button {
+            let account = snapshot.currentAccount == "none" ? "—" : snapshot.currentAccount
+            button.title = " \(account) · \(snapshot.menuSummary)"
+            button.image = NSImage(systemSymbolName: snapshot.symbol, accessibilityDescription: "Claude 切换器")
+            button.image?.isTemplate = true
+            button.imagePosition = .imageLeading
+            button.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            let shortcut = preferences.shortcut?.label ?? "点击"
+            button.toolTip = "Claude 切换器 · 最近检查：\(snapshot.menuSummary)\n\(shortcut) 呼出；右键显示菜单"
+            button.setAccessibilityLabel("Claude 切换器，账号 \(account)，最近检查 \(snapshot.menuSummary)")
+        }
+        widgetPublisher?.publish(snapshot)
+    }
+
+    @objc private func statusClicked() {
+        if NSApplication.shared.currentEvent?.type == .rightMouseUp {
+            let menu = NSMenu()
+            menu.autoenablesItems = false
+            menu.delegate = self
+            func item(_ title: String, _ action: Selector, enabled: Bool = true) {
+                let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+                entry.target = self; entry.isEnabled = enabled
+                menu.addItem(entry)
+            }
+            item("呼出快捷面板", #selector(menuOpen))
+            item("重新检查", #selector(menuRefresh), enabled: !vm.isBusy)
+            item("检查设置与快捷键", #selector(menuSettings))
+            item("检查更新", #selector(menuUpdate))
+            menu.addItem(.separator())
+            item("退出 Claude 切换器", #selector(menuQuit), enabled: vm.canQuit)
+            statusItem?.menu = menu
+            statusItem?.button?.performClick(nil)
+        } else {
+            togglePanel()
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) { statusItem?.menu = nil }
+    @objc private func menuOpen() { showMainWindow() }
+    func recheckFromMenu() { vm.refresh(); showMainWindow() }
+    @objc private func menuRefresh() { recheckFromMenu() }
+    @objc private func menuSettings() { showMainWindow(); vm.showSettingsSheet = true }
+    @objc private func menuUpdate() { showMainWindow(); vm.checkUpdate(); vm.showUpdateSheet = true }
+    @objc private func menuQuit() { if vm.canQuit { NSApplication.shared.terminate(nil) } }
+
+    func togglePanel() {
+        if mainWindow?.isVisible == true { hidePanel() }
+        else { showMainWindow() }
+    }
+
+    func handleShortcutPress(timestamp: TimeInterval, isRepeat: Bool = false) {
+        guard !preferences.isRecordingShortcut, NSApplication.shared.modalWindow == nil,
+              mainWindow?.attachedSheet == nil,
+              !(mainWindow?.childWindows?.contains(where: { $0.isVisible }) ?? false),
+              shortcutPressGate.accepts(timestamp: timestamp, isRepeat: isRepeat) else { return }
+        togglePanel()
+    }
+
+    func hidePanel() { mainWindow?.orderOut(nil) }
+
     func showMainWindow() {
         vm.prepareToShow()
+        vm.refreshAccountStatus()
         if mainWindow == nil {
-            let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable]
-            let titleHeight = NSWindow.frameRect(forContentRect: .zero, styleMask: style).height
-            let height = min(CGFloat(900), (NSScreen.main?.visibleFrame.height ?? 900) - titleHeight)
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 440, height: height),
-                styleMask: style,
-                backing: .buffered, defer: false
-            )
-            window.title = "Claude切换器"
-            window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-            window.isMovableByWindowBackground = true
-            window.isReleasedWhenClosed = false
-            window.standardWindowButton(.zoomButton)?.isEnabled = false
-            window.contentView = NSHostingView(rootView: ContentView(vm: vm, height: height))
-            window.delegate = self
-            window.center()
-            mainWindow = window
+            let panel = QuickAccessPanel(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
+                styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.title = "Claude 切换器"
+            panel.isFloatingPanel = true
+            panel.level = .floating
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
+            panel.hasShadow = true
+            panel.hidesOnDeactivate = false
+            panel.isMovableByWindowBackground = true
+            panel.isReleasedWhenClosed = false
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.contentView = NSHostingView(rootView: QuickPanelView(vm: vm,
+                onDismiss: { [weak self] in self?.hidePanel() },
+                shortcutSettings: AnyView(ShortcutSettingsView(preferences: preferences))))
+            panel.delegate = self
+            mainWindow = panel
         }
         if mainWindow?.isMiniaturized == true { mainWindow?.deminiaturize(nil) }
+        if let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main {
+            let frame = screen.visibleFrame
+            mainWindow?.setFrameOrigin(NSPoint(x: frame.midX - 380, y: frame.midY - 230))
+        }
         mainWindow?.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
-        return false
+    var canAutoDismiss: Bool {
+        guard !vm.isBusy, !vm.settingsBusy, !preferences.isRecordingShortcut,
+              NSApplication.shared.modalWindow == nil, mainWindow?.attachedSheet == nil else { return false }
+        return !(mainWindow?.childWindows?.contains(where: { $0.isVisible }) ?? false)
     }
 
+    func dismissOnDeactivation() {
+        if canAutoDismiss { hidePanel() }
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        // 保存对话框与提示框会临时取走焦点，下一轮再判断模态状态。
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.mainWindow?.isKeyWindow != true else { return }
+            self.dismissOnDeactivation()
+        }
+    }
+    func applicationDidResignActive(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !NSApplication.shared.isActive else { return }
+            self.dismissOnDeactivation()
+        }
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { hidePanel(); return false }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply { vm.canQuit ? .terminateNow : .terminateCancel }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showMainWindow(); return false }
 
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        vm.canQuit ? .terminateNow : .terminateCancel
+    func application(_ application: NSApplication, open urls: [URL]) {
+        if urls.contains(where: { $0.scheme == "claude-switcher" && $0.host == "panel" && ($0.path.isEmpty || $0.path == "/") && $0.query == nil }) {
+            showMainWindow()
+        }
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showMainWindow()
-        return false
+    deinit {
+        if let localEventMonitor = localEventMonitor { NSEvent.removeMonitor(localEventMonitor) }
+        if let statusItem = statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
     }
 }
 
@@ -1431,8 +2502,8 @@ struct MenuBarContent: View {
         Button("打开主窗口", action: showWindow)
             .keyboardShortcut("o")
         Button("重新检查") {
-            showWindow()
             vm.refresh()
+            showWindow()
         }
         .disabled(vm.isBusy)
         Button("检查更新") {
@@ -1459,20 +2530,8 @@ struct SwitcherMenu: Scene {
     @ObservedObject var vm: VM
     let controller: AppDelegate
 
-    private static let statusImage: NSImage = {
-        let image = NSImage(systemSymbolName: "shield.lefthalf.filled", accessibilityDescription: "Claude 切换器")!
-        image.isTemplate = true
-        return image
-    }()
-
     var body: some Scene {
-        MenuBarExtra {
-            MenuBarContent(vm: vm, showWindow: controller.showMainWindow)
-        } label: {
-            Image(nsImage: Self.statusImage)
-                .accessibilityLabel("Claude 切换器")
-        }
-        .menuBarExtraStyle(.menu)
+        Settings { EmptyView() }
         .commands {
             CommandGroup(replacing: .appTermination) {
                 Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }

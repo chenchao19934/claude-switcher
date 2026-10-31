@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Carbon
 
 private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性"]
 
@@ -45,7 +46,7 @@ private final class Fixture {
           checkdetail) delay check; cat "$root/audit"; result check ;;
           status) cat "$root/status"; result status ;;
           get-client) echo 'client=clash-verge' ;;
-          get-check-config) cat "$root/check-config"; result get-config ;;
+          get-check-config) delay get-config; cat "$root/check-config"; result get-config ;;
           set-check-config) printf '%s\n' "$2" > "$root/saved-config"; result set-config ;;
           switch) delay switch; cat "$root/switch-output"; result switch ;;
           fix) delay fix; echo 'FIX:演示修复完成'; result fix ;;
@@ -293,15 +294,293 @@ struct MenuBarModelTests {
                 delegate.showMainWindow()
                 let first = delegate.mainWindow
                 try expect(first?.isVisible == true, "首次启动应该显示窗口")
-                first?.performClose(nil)
+                try expect(first is NSPanel, "快捷呼出应该使用 NSPanel")
+                try expect(first?.styleMask.contains(.nonactivatingPanel) == true, "快捷面板应支持非激活呼出")
+                try expect(first?.styleMask.contains(.miniaturizable) == false, "快捷面板不应提供最小化")
+                try expect(first?.isReleasedWhenClosed == false, "收起后必须保留同一面板")
+                try expect(first?.level == .floating, "快捷面板应浮于普通窗口")
+                try expect(delegate.windowShouldClose(first!) == false, "关闭应由控制器转为隐藏")
                 try expect(first?.isVisible == false, "关窗应该隐藏")
                 try expect(!delegate.applicationShouldTerminateAfterLastWindowClosed(app), "关窗不应退出")
                 delegate.showMainWindow()
                 try expect(delegate.mainWindow === first && first?.isVisible == true, "重开应该复用同一窗口")
-                delegate.mainWindow?.miniaturize(nil)
-                delegate.showMainWindow()
-                try expect(first?.isMiniaturized == false, "重开应该恢复最小化窗口")
                 first?.orderOut(nil)
+            case "panel_toggle_no_audit":
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm)
+                NSApplication.shared.setActivationPolicy(.accessory)
+                delegate.togglePanel()
+                let first = delegate.mainWindow
+                try expect(first?.isVisible == true, "首次 toggle 应呼出面板")
+                delegate.togglePanel()
+                try expect(first?.isVisible == false, "第二次 toggle 应收起面板")
+                delegate.togglePanel()
+                try expect(first?.isVisible == true && delegate.mainWindow === first, "第三次 toggle 应复用原面板")
+                try expect(f.calls.isEmpty, "呼出和收起不能触发额外安检或账号操作")
+                try expect(delegate.statusItem == nil, "隔离控制器不得自动创建系统集成")
+                delegate.hidePanel()
+            case "panel_menu_recheck":
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm)
+                NSApplication.shared.setActivationPolicy(.accessory)
+                vm.start()
+                try f.idle(vm)
+                try expect(f.calls == ["checkdetail", "get-client", "status"], "应先完成一次启动审计")
+                delegate.recheckFromMenu()
+                try f.idle(vm)
+                try expect(f.calls == ["checkdetail", "get-client", "status", "checkdetail", "get-client", "status"], "菜单重新检查必须新增完整审计，不能被呼出时的本地状态读取吞掉")
+                try expect(vm.phase == .ready && delegate.mainWindow?.isVisible == true, "菜单重检应呼出面板并完成检查")
+                delegate.hidePanel()
+            case "panel_idle_deactivation":
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm)
+                NSApplication.shared.setActivationPolicy(.accessory)
+                delegate.showMainWindow()
+                try expect(delegate.canAutoDismiss, "空闲面板应该允许失焦收起")
+                delegate.dismissOnDeactivation()
+                try expect(delegate.mainWindow?.isVisible == false, "空闲失焦应收起面板")
+                try expect(f.calls.isEmpty && vm.canQuit, "失焦不应执行核心命令或改变退出许可")
+            case "panel_busy_deactivation":
+                try f.write("check-delay", "0.2")
+                try f.write("fix-delay", "0.2")
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm)
+                NSApplication.shared.setActivationPolicy(.accessory)
+                delegate.showMainWindow()
+                vm.refresh()
+                try expect(vm.isBusy && !delegate.canAutoDismiss, "审计期间不得自动收起")
+                delegate.dismissOnDeactivation()
+                try expect(delegate.mainWindow?.isVisible == true, "审计失焦必须保留进度")
+                try f.idle(vm)
+                vm.fixAll()
+                delegate.dismissOnDeactivation()
+                try expect(delegate.mainWindow?.isVisible == true && !delegate.canAutoDismiss, "修复失焦必须保留面板")
+                try f.idle(vm)
+                vm.switchTo("B")
+                delegate.dismissOnDeactivation()
+                try expect(delegate.mainWindow?.isVisible == true && !delegate.canAutoDismiss, "切换前审计失焦必须保留面板")
+                try f.idle(vm)
+                try expect(vm.current == "B", "失焦不能取消正在进行的切换")
+                delegate.hidePanel()
+            case "panel_settings_recording_guard":
+                try f.write("check-config", #"{"disabled":[],"allowOptionalFailures":false,"logging":true}"#)
+                try f.write("get-config-delay", "0.2")
+                let vm = f.vm()
+                let preferences = AppPreferences()
+                let delegate = AppDelegate(vm: vm, preferences: preferences)
+                NSApplication.shared.setActivationPolicy(.accessory)
+                delegate.showMainWindow()
+                vm.loadCheckConfig()
+                try expect(vm.settingsBusy && !vm.isBusy && !delegate.canAutoDismiss, "设置读取需要独立失焦保护")
+                delegate.dismissOnDeactivation()
+                try expect(delegate.mainWindow?.isVisible == true, "设置读取中不能自动收起")
+                try spin { !vm.settingsBusy }
+                preferences.isRecordingShortcut = true
+                try expect(!delegate.canAutoDismiss, "录制快捷键期间不能自动收起")
+                delegate.dismissOnDeactivation()
+                try expect(delegate.mainWindow?.isVisible == true, "录制失焦应保留面板")
+                preferences.isRecordingShortcut = false
+                try expect(delegate.canAutoDismiss, "设置读取与录制结束应解除保护")
+                delegate.dismissOnDeactivation()
+                try expect(delegate.mainWindow?.isVisible == false, "保护解除后失焦应收起")
+            case "panel_child_sheet_guard":
+                let delegate = AppDelegate(vm: f.vm())
+                NSApplication.shared.setActivationPolicy(.accessory)
+                delegate.showMainWindow()
+                let parent = delegate.mainWindow!
+                let child = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 180, height: 80), styleMask: .titled, backing: .buffered, defer: false)
+                parent.addChildWindow(child, ordered: .above)
+                child.orderFront(nil)
+                try expect(child.isVisible && !delegate.canAutoDismiss, "可见子窗口必须保护主面板")
+                delegate.dismissOnDeactivation()
+                try expect(parent.isVisible, "子窗口临时取焦不能收起主面板")
+                parent.removeChildWindow(child)
+                child.orderOut(nil)
+                let sheet = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 180, height: 80), styleMask: .titled, backing: .buffered, defer: false)
+                parent.beginSheet(sheet)
+                try expect(parent.attachedSheet === sheet && !delegate.canAutoDismiss, "附加 sheet 必须保护主面板")
+                delegate.dismissOnDeactivation()
+                try expect(parent.isVisible, "sheet 临时取焦不能收起主面板")
+                parent.endSheet(sheet)
+                sheet.orderOut(nil)
+                try spin { parent.attachedSheet == nil }
+                try expect(delegate.canAutoDismiss, "子窗口与 sheet 关闭后应恢复自动收起")
+                delegate.hidePanel()
+            case "panel_busy_close":
+                try f.write("fix-delay", "0.2")
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm)
+                let app = NSApplication.shared
+                app.setActivationPolicy(.accessory)
+                delegate.showMainWindow()
+                vm.fixAll()
+                try expect(delegate.windowShouldClose(delegate.mainWindow!) == false, "繁忙关闭仍应转为收起")
+                try expect(delegate.mainWindow?.isVisible == false && vm.isBusy, "收起不得取消后台修复")
+                try expect(delegate.applicationShouldTerminate(app) == .terminateCancel, "收起后仍必须阻止退出修复进程")
+                try expect(!delegate.applicationShouldTerminateAfterLastWindowClosed(app), "收起最后一个窗口不应退出")
+                delegate.showMainWindow()
+                try expect(delegate.mainWindow?.isVisible == true && vm.isBusy, "重开应保留繁忙进度")
+                try f.idle(vm)
+                try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "繁忙关闭和重开不得重复修复或审计")
+                delegate.hidePanel()
+            case "panel_url_open_only":
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm)
+                let app = NSApplication.shared
+                app.setActivationPolicy(.accessory)
+                for text in ["https://panel", "claude-switcher://switch/B", "claude-switcher://panel?account=B", "claude-switcher://panel/other"] {
+                    delegate.application(app, open: [URL(string: text)!])
+                    try expect(delegate.mainWindow == nil, "不支持的 URL 不应创建面板")
+                }
+                delegate.application(app, open: [URL(string: "claude-switcher://panel")!])
+                try expect(delegate.mainWindow?.isVisible == true, "Widget URL 应呼出面板")
+                try expect(f.calls.isEmpty && vm.current == "?", "Widget URL 不能触发安检、换号或启动 Claude")
+                delegate.hidePanel()
+            case "shortcut_preferences":
+                let suite = "claude-switcher.tests.\(UUID().uuidString)"
+                guard let defaults = UserDefaults(suiteName: suite) else { throw TestFailure(description: "无法创建隔离偏好") }
+                defer { defaults.removePersistentDomain(forName: suite) }
+                let preferences = AppPreferences(defaults: defaults)
+                let delegate = AppDelegate(vm: f.vm(), preferences: preferences)
+                try expect(preferences.shortcut == .standard && GlobalShortcut.standard.isValid, "首次启动应有有效默认快捷键")
+                try expect(GlobalShortcut.standard.label == "⌃⌥Space", "默认快捷键文案不正确")
+                let custom = GlobalShortcut(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey | optionKey | shiftKey))
+                delegate.setShortcut(custom)
+                try expect(preferences.shortcut == custom && custom.label == "⌃⌥⇧K", "应保存自定义快捷键及文案")
+                try expect(AppPreferences(defaults: defaults).shortcut == custom, "重载应保留自定义快捷键")
+                delegate.setShortcut(nil)
+                try expect(preferences.shortcut == nil && AppPreferences(defaults: defaults).shortcut == nil, "停用必须持久化，不能重载后自动恢复")
+                delegate.setShortcut(.standard)
+                try expect(AppPreferences(defaults: defaults).shortcut == .standard, "恢复默认必须持久化")
+                try expect(f.calls.isEmpty, "修改快捷键不得执行核心命令")
+            case "shortcut_invalid_rejected":
+                let suite = "claude-switcher.tests.\(UUID().uuidString)"
+                guard let defaults = UserDefaults(suiteName: suite) else { throw TestFailure(description: "无法创建隔离偏好") }
+                defer { defaults.removePersistentDomain(forName: suite) }
+                let preferences = AppPreferences(defaults: defaults)
+                let delegate = AppDelegate(vm: f.vm(), preferences: preferences)
+                let custom = GlobalShortcut(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(cmdKey | optionKey))
+                delegate.setShortcut(custom)
+                for invalid in [GlobalShortcut(keyCode: 0, modifiers: 0), GlobalShortcut(keyCode: 0, modifiers: UInt32(shiftKey)), GlobalShortcut(keyCode: UInt32(kVK_Escape), modifiers: UInt32(controlKey)), GlobalShortcut(keyCode: 127, modifiers: UInt32(cmdKey)), GlobalShortcut(keyCode: 0, modifiers: UInt32.max)] {
+                    try expect(!invalid.isValid, "非法组合不应被标记为有效")
+                    delegate.setShortcut(invalid)
+                    try expect(preferences.shortcut == custom, "无系统集成模式也必须拒绝非法组合并保留原设置")
+                    try expect(AppPreferences(defaults: defaults).shortcut == custom, "非法组合不得覆盖已保存快捷键")
+                    try expect(!preferences.shortcutMessage.isEmpty, "拒绝非法组合应提供原因")
+                }
+                defaults.set(try JSONEncoder().encode(GlobalShortcut(keyCode: 0, modifiers: 0)), forKey: "quickPanel.shortcut")
+                try expect(AppPreferences(defaults: defaults).shortcut == .standard, "落盘组合无效时应安全回退默认")
+            case "shortcut_press_gate":
+                var gate = ShortcutPressGate()
+                try expect(gate.accepts(timestamp: 100), "首次快捷键应被接受")
+                try expect(!gate.accepts(timestamp: 100), "同一按键经 Carbon 与本地路径到达时只能接受一次")
+                try expect(!gate.accepts(timestamp: 100.01) && !gate.accepts(timestamp: 100.149), "来源时间轻微漂移不能造成双重 toggle")
+                try expect(gate.accepts(timestamp: 100.2), "正常后续按键应可继续呼出")
+                try expect(!gate.accepts(timestamp: 101, isRepeat: true), "长按自动重复不能切换面板")
+                try expect(gate.accepts(timestamp: 101), "被拒绝的自动重复不能阻止后续真实按键")
+                for invalid in [-1.0, Double.infinity, -Double.infinity, Double.nan] {
+                    try expect(!gate.accepts(timestamp: invalid), "非法时间不得改变快捷键状态")
+                }
+                try expect(!gate.accepts(timestamp: 100.5), "迟到的旧事件不得再次切换")
+                try expect(gate.accepts(timestamp: 101.2), "旧事件与非法时间不应破坏后续正常事件")
+            case "panel_shortcut_protection":
+                let preferences = AppPreferences()
+                let delegate = AppDelegate(vm: f.vm(), preferences: preferences)
+                NSApplication.shared.setActivationPolicy(.accessory)
+                delegate.showMainWindow()
+                let parent = delegate.mainWindow!
+                preferences.isRecordingShortcut = true
+                delegate.handleShortcutPress(timestamp: 100)
+                try expect(parent.isVisible, "录制中的快捷键不能收起面板")
+                preferences.isRecordingShortcut = false
+                let child = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 180, height: 80), styleMask: .titled, backing: .buffered, defer: false)
+                parent.addChildWindow(child, ordered: .above)
+                child.orderFront(nil)
+                delegate.handleShortcutPress(timestamp: 101)
+                try expect(parent.isVisible && child.isVisible, "Carbon 与本地统一入口都必须保护可见子窗口")
+                parent.removeChildWindow(child)
+                child.orderOut(nil)
+                let sheet = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 180, height: 80), styleMask: .titled, backing: .buffered, defer: false)
+                parent.beginSheet(sheet)
+                delegate.handleShortcutPress(timestamp: 102)
+                try expect(parent.isVisible && parent.attachedSheet === sheet, "附加 sheet 期间快捷键不能隐藏主面板")
+                parent.endSheet(sheet)
+                sheet.orderOut(nil)
+                try spin { parent.attachedSheet == nil }
+                delegate.showMainWindow()
+                delegate.handleShortcutPress(timestamp: 103)
+                try expect(!parent.isVisible, "录制与模态保护结束后快捷键应恢复切换")
+                try expect(f.calls.isEmpty, "快捷键保护不能执行核心命令")
+            case "panel_shortcut_busy_toggle":
+                try f.write("fix-delay", "0.2")
+                let vm = f.vm()
+                let delegate = AppDelegate(vm: vm)
+                NSApplication.shared.setActivationPolicy(.accessory)
+                delegate.showMainWindow()
+                vm.fixAll()
+                delegate.handleShortcutPress(timestamp: 100)
+                try expect(delegate.mainWindow?.isVisible == false && vm.isBusy && !vm.canQuit, "手动快捷键可收起繁忙面板，但不得取消修复或解除退出保护")
+                delegate.handleShortcutPress(timestamp: 100)
+                delegate.handleShortcutPress(timestamp: 100.02)
+                try expect(delegate.mainWindow?.isVisible == false, "同一按键的两来源不能把面板重新弹出")
+                delegate.handleShortcutPress(timestamp: 100.3)
+                try expect(delegate.mainWindow?.isVisible == true && vm.isBusy, "后续真实按键应能重开并保留修复进度")
+                try f.idle(vm)
+                try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "手动快捷键收起与重开不能重复或中断修复")
+                delegate.hidePanel()
+            case "snapshot_status_semantics":
+                let vm = f.vm()
+                let initial = WidgetStatusSnapshot.capture(vm, checkedAt: 0)
+                try expect(initial.pending == 14 && initial.passed == 0 && initial.menuSummary == "检查中", "初始 pending 不得显示成通过")
+                vm.phase = .ready
+                try expect(WidgetStatusSnapshot.capture(vm, checkedAt: 42).menuSummary == "待检查", "仍有 pending 时不能显示通过")
+                for index in vm.rows.indices { vm.rows[index].state = .ok }
+                try expect(WidgetStatusSnapshot.capture(vm, checkedAt: 0).menuSummary == "待检查", "没有检查时间不能显示通过")
+                let passed = WidgetStatusSnapshot.capture(vm, checkedAt: 42)
+                try expect(passed.passed == 14 && passed.menuSummary == "通过" && passed.symbol == "checkmark.shield", "全部完成时才可显示通过")
+                vm.rows[0].state = .warn
+                let warning = WidgetStatusSnapshot.capture(vm, checkedAt: 42)
+                try expect(warning.passed == 13 && warning.warning == 1 && warning.menuSummary == "有警告" && warning.symbol == "exclamationmark.triangle", "警告必须与通过区分")
+                vm.rows[0].state = .skip
+                let skipped = WidgetStatusSnapshot.capture(vm, checkedAt: 42)
+                try expect(skipped.passed == 13 && skipped.skipped == 1 && skipped.menuSummary == "含跳过" && skipped.symbol == "minus.circle", "跳过必须与通过区分")
+                vm.rows[0].state = .fail
+                let failed = WidgetStatusSnapshot.capture(vm, checkedAt: 42)
+                try expect(failed.failed == 1 && failed.menuSummary == "未通过" && failed.symbol == "exclamationmark.shield", "失败不能被 ready 阶段覆盖")
+                vm.rows[0].state = .ok
+                vm.phase = .failed
+                try expect(WidgetStatusSnapshot.capture(vm, checkedAt: 42).menuSummary == "未通过", "阶段失败不能被全 ok 行覆盖")
+                for (phase, title) in [(Phase.checking, "检查中"), (.fixing, "修复中"), (.switching, "切换中")] {
+                    vm.phase = phase
+                    let snapshot = WidgetStatusSnapshot.capture(vm, checkedAt: 42)
+                    try expect(snapshot.menuSummary == title && snapshot.symbol == "arrow.triangle.2.circlepath", "繁忙阶段必须显示当前操作")
+                }
+                vm.phase = .ready
+                vm.rows.removeLast()
+                try expect(WidgetStatusSnapshot.capture(vm, checkedAt: 42).menuSummary == "待检查", "不完整结果不能显示通过")
+            case "snapshot_privacy":
+                let vm = f.vm()
+                vm.phase = .ready
+                for index in vm.rows.indices { vm.rows[index].state = .ok }
+                for account in VM.accountLetters {
+                    vm.current = account
+                    try expect(WidgetStatusSnapshot.capture(vm, checkedAt: 42).currentAccount == account, "共享状态应保留 A-D 槽位")
+                }
+                for account in ["none", "未知", "?", "E", "A 198.51.100.23"] {
+                    vm.current = account
+                    try expect(WidgetStatusSnapshot.capture(vm, checkedAt: 42).currentAccount == "none", "任意账号字符串不得进入共享状态")
+                }
+                vm.rows[0].detail = "198.51.100.23 Bearer synthetic-secret session=fake"
+                vm.banner = "198.51.100.24 cookie=fake"
+                vm.fingerprint = "private fingerprint"
+                let snapshot = WidgetStatusSnapshot.capture(vm, checkedAt: 42)
+                let encoded = try JSONEncoder().encode(snapshot)
+                let text = String(decoding: encoded, as: UTF8.self)
+                try expect(!text.contains("198.51.100") && !text.contains("Bearer") && !text.contains("synthetic-secret") && !text.contains("cookie") && !text.contains("detail") && !text.contains("fingerprint"), "共享状态不得包含 IP、凭据或原始详情")
+                guard let object = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] else { throw TestFailure(description: "快照不是 JSON 对象") }
+                try expect(Set(object.keys) == Set(["schemaVersion", "currentAccount", "status", "checkedAt", "passed", "warning", "failed", "skipped", "pending"]), "共享状态只允许脱敏摘要字段")
+                let decoded = try JSONDecoder().decode(WidgetStatusSnapshot.self, from: encoded)
+                try expect(decoded == snapshot, "共享状态应可无损解码")
             case "termination_guard":
                 let vm = f.vm()
                 let delegate = AppDelegate(vm: vm)
