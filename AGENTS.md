@@ -37,7 +37,7 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：读取本维护仓库正式 `releases/latest` → 下载同版本、同架构 `update.zip` 和 `SHA256SUMS-release.txt` → 校验外层 ZIP SHA256、VERSION 与内部核心三工件／守护三模板清单 → 剔除 5 个配置行比对核心与配套脚本 → 备份各工件 `.bak` → 按字面赋值行保留配置并替换核心／STUN／用户态更新组件 → 复核落盘工件的字节、常规文件类型、当前用户所有权和权限；写入或文件验证失败均回滚全部工件。终端升级不执行 `checkdetail`，不以 14 项环境状态作为准入或回滚条件，也不启动 Claude。只读检查不创建账号目录、日志或更新锁；没有正式发布时只提示，不回退 main。终端更新不改变 GUI 版本或部署 root 守护）
+日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `cli [args...]`（以当前桌面账号启动 Claude Code，参数原样透传；启动前审计并拒绝认证环境变量覆盖，B–D 首次使用各自登录一次，各账号历史独立）/ `cli-current`（只读输出当前槽位与映射的 CLAUDE_CONFIG_DIR 目录）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：读取本维护仓库正式 `releases/latest` → 下载同版本、同架构 `update.zip` 和 `SHA256SUMS-release.txt` → 校验外层 ZIP SHA256、VERSION 与内部核心三工件／守护三模板清单 → 剔除 5 个配置行比对核心与配套脚本 → 备份各工件 `.bak` → 按字面赋值行保留配置并替换核心／STUN／用户态更新组件 → 复核落盘工件的字节、常规文件类型、当前用户所有权和权限；写入或文件验证失败均回滚全部工件。终端升级不执行 `checkdetail`，不以 14 项环境状态作为准入或回滚条件，也不启动 Claude。只读检查不创建账号目录、日志或更新锁；没有正式发布时只提示，不回退 main。终端更新不改变 GUI 版本或部署 root 守护）
 
 
 macOS 界面更新：新版「版本更新」页使用 App 内置的 `core/desktop-update.py`（安装／打包时复制到 `Contents/Resources/desktop-update.py`），先只读检查，再由用户确认准备、校验安装包及配置、备份替换 App／核心／STUN，替换后验证落盘工件并完成重启握手；文件验证、替换或重启确认失败回滚全部。客户端只读取当前维护仓库 `chenchao19934/claude-switcher` 的正式 `releases/latest`（非草稿、非预发布，标签 `v主版本.次版本.修订版本`），按本机 arm64／x86_64 下载同版本预编译 ZIP 与外部 SHA256 清单，验证包、版本、架构、App 签名及内部核心／守护工件。用户更新无需本机编译或 Xcode 命令行工具，Python 3 仍需可用；不得回退到 main；仅界面变化也须递增正式语义版本。两条更新路径共用 `~/.claude-switcher/.update.lock`，不清未知锁；拒绝 root 实际更新，守护模板只比对并提示。旧 GUI 需先替换一次新版引导 App，之后可在页面更新；正式签名／Widget 版本需用相同签名的专用渠道。账号、设置、代理和 root 服务不参与替换。暂存／worker／握手与回滚边界见 `docs/MACOS-UPDATES.md`。
@@ -83,11 +83,13 @@ macOS 正式发布流程：维护者确定新的三段语义版本后，经当�
 | Windows 地区检查误红（非美国用户） | `$LOCALE_TARGET` 与系统「区域格式」不一致；旧版曾写死 `en-US` | 运行 `claude-switch.ps1 set-region`；或在「设置 → 时间和语言 → 语言和区域 → 区域格式」中改成目标 locale，并确认 `$LOCALE_TARGET` |
 | 切换账号后对方看到"新设备" | 正常：快照隔离意味着每个账号有独立设备指纹，这正是设计目标 | 无需处理 |
 | 切换后某些文件没过去／不该过去 | 跨身份保留默认关闭，只复制 `~/.claude-switcher/keep-in-workspace.txt` 中列出的相对路径；绝对路径、含 `..`、符号链接会被跳过 | 对照该文件与 `~/Library/Logs/claude-switch.log` 的 WARN；只保留通用配置，不要把登录态/缓存列进去 |
+| `cli` 启动报「检测到认证环境变量…已拒绝启动」 | shell 配置了 `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` 等覆盖，切换器无法保证账号隔离 | 取消对应变量后再用 `claude-switch.sh cli` 启动；不要为绕过而改代码放宽，认证覆盖本来就不属于按目录隔离模型 |
+| 切到 B/C/D 后第一次用 `cli` 要求登录 | 预期行为：B–D 各自使用 `~/.claude-switcher/cli-accounts/<槽位>/` 独立目录，首次各登录一次 | 在弹出的 CLI 里完成登录即可；可用官方 `claude auth status` 自查，切换器不读取凭据自动断言；登录过期后仍可能需重新认证 |
 
 ## 安全红线（Agent 必须遵守）
 
 1. **绝不在出口国家与目标不一致时启动 Claude**——任何时候先验 cloudflare trace 的 `loc` 与脚本头部 `COUNTRY_TARGET` 一致；换了国家节点先跑 `claude-switch.sh set-region` 再启动
-2. 切换账号前必须先完全退出 Claude 进程，再交换数据目录
+2. 切换账号前必须先完全退出 Claude 进程，并等待安装用户的全部 Claude Code CLI 进程退出（TERM 后最多 10 秒）；CLI 未退出时切换必须中止，桌面数据与当前指针保持不变
 3. 不要在日志、文档、Issue 里暴露用户的住宅/代理 IP 与任何凭据
 4. 不要改动 `~/.claude-switcher/accounts/` 下的存档结构
 5. **维护纪律**：`core/`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——CI 打包前校验该清单；正式更新包另带核心／守护工件内部清单，Release 统一清单校验整个 ZIP，任一不一致均应中止
@@ -160,4 +162,4 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 - 不得改动 `/Library/Application Support/claude-switcher/`、`/Library/LaunchDaemons/local.claude-*`、`~/Library/LaunchAgents/local.claude-*`
 - 不得触发本机 `update`、不得执行安装器/卸载器
 
-日常开发默认流程：**只修改仓库文件 → 验证（本地只跑不影响安装态的测试/静态检查）→ 提交推送**。维护者已持续授权：每次修复完成并通过适用验证后，可直接提交并推送 `main`，无需逐次确认；推送前仍需 `git fetch origin main` 核对远端，不得覆盖他人工作，也不得提交故意保留的未跟踪交接文档。需要真机验证时，先询问维护者是否允许在本机部署。打 tag、发布 Release、执行安装器/更新器或修改真实账号与代理配置，仍须逐次明确授权。
+日常开发默认流程：**只修改仓库文件 → 验证（本地只跑不影响安装态的测试/静态检查）→ 提交推送**。维护者已持续授权：每次修复完成并通过适用验证后，可直接提交并推送 `main`，无需逐次确认；推送前仍需 `git fetch origin main` 核对远端，不得覆盖他人工作，也不得提交故意保留的未跟踪交接文档。Issue 回复后可直接关闭，无需逐次确认；已修复的标记为完成，信息不足或不打算继续处理的应选择相应关闭原因，不得伪装成已修复。需要真机验证时，先询问维护者是否允许在本机部署。打 tag、发布 Release、执行安装器/更新器或修改真实账号与代理配置，仍须逐次明确授权。

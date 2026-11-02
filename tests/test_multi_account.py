@@ -22,6 +22,8 @@ FUNCTIONS = (
     "keep_path_safe",
     "stage_keep_paths",
     "restore_keep_paths",
+    "cli_lock_acquire",
+    "cli_lock_release",
     "archive_current",
     "switch_to",
 )
@@ -85,7 +87,21 @@ copy_tree() {
     if [ "$INJECT" = "copy_error" ]; then return 43; fi
     mkdir -p "$2" && cp -R "$1/." "$2/"
 }
+mkdir() {
+    if [ "$INJECT" = "account_before_lock" ] && [ "${1:-}" = "$BASE/cli-operation.lock" ]; then
+        # Another switch commits A -> B immediately before this lock is acquired.
+        printf 'live-A' > "$BASE/accounts/A/marker"
+        printf 'B' > "$BASE/current"
+        printf 'live-B' > "$DATA/marker"
+    fi
+    command mkdir "$@"
+}
 quit_claude() { return 0; }
+quit_cli() {
+    if [ "$INJECT" = "cli_error" ]; then return 1; fi
+    printf 'called' > "$FIXTURE/cli-quit"
+    return 0
+}
 open() { printf 'called' > "$FIXTURE/launched"; }
 ditto() {
     if [ "$INJECT" = "stage_error" ]; then
@@ -166,6 +182,58 @@ ditto() {
             (self.base / "accounts" / "B" / "marker").read_text(), "saved-B"
         )
         self.assertFalse((self.data / "marker").exists())
+        self.assertTrue((self.fixture / "cli-quit").exists())
+
+    def test_switch_stops_when_cli_cannot_exit(self):
+        self.account("A").joinpath("marker").write_text("old-A", encoding="utf-8")
+        (self.base / "current").write_text("A", encoding="utf-8")
+        (self.data / "marker").write_text("live-A", encoding="utf-8")
+
+        result = self.run_shell("switch_to B", injection="cli_error")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Claude Code", result.stdout)
+        self.assertEqual((self.base / "current").read_text().strip(), "A")
+        self.assertEqual((self.data / "marker").read_text(), "live-A")
+        self.assertFalse((self.fixture / "launched").exists())
+
+    def test_switch_stops_when_cli_launch_holds_operation_lock(self):
+        self.account("A").joinpath("marker").write_text("old-A", encoding="utf-8")
+        (self.base / "current").write_text("A", encoding="utf-8")
+        (self.base / "cli-operation.lock").mkdir()
+        (self.data / "marker").write_text("live-A", encoding="utf-8")
+
+        result = self.run_shell("switch_to B")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.base / "current").read_text().strip(), "A")
+        self.assertEqual((self.data / "marker").read_text(), "live-A")
+        self.assertFalse((self.fixture / "launched").exists())
+
+    def test_switch_reads_current_after_acquiring_operation_lock(self):
+        self.account("A").joinpath("marker").write_text("saved-A", encoding="utf-8")
+        self.account("B").joinpath("marker").write_text("saved-B", encoding="utf-8")
+        (self.base / "current").write_text("A", encoding="utf-8")
+        (self.data / "marker").write_text("live-A", encoding="utf-8")
+
+        result = self.run_shell("switch_to C", injection="account_before_lock")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.base / "accounts/A/marker").read_text(), "live-A")
+        self.assertEqual((self.base / "accounts/B/marker").read_text(), "live-B")
+        self.assertEqual((self.base / "current").read_text().strip(), "C")
+        self.assertFalse((self.base / "cli-operation.lock").exists())
+
+    def test_same_account_restore_respects_operation_lock(self):
+        self.account("A").joinpath("marker").write_text("saved-A", encoding="utf-8")
+        (self.base / "current").write_text("A", encoding="utf-8")
+        self.data.rmdir()
+        (self.base / "cli-operation.lock").mkdir()
+
+        result = self.run_shell("switch_to A")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.data.exists())
+        self.assertFalse((self.fixture / "launched").exists())
+        self.assertTrue((self.base / "cli-operation.lock").is_dir())
 
     def test_switch_rejects_unknown_account(self):
         self.account("A").joinpath("marker").write_text("old-A", encoding="utf-8")

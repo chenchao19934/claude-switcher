@@ -418,12 +418,14 @@ else
         chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' '/Library/Application Support/claude-switcher/bodyguard-settings.py' || exit 1;
         chmod -N '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' '/Library/Application Support/claude-switcher/bodyguard-settings.py' 2>/dev/null || true;
         chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' '/Library/Application Support/claude-switcher/bodyguard-settings.py' || exit 1;
+        /usr/bin/xattr -d com.apple.quarantine '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh' '/Library/Application Support/claude-switcher/bodyguard-settings.py' 2>/dev/null || true;
         if [ -L '/Library/LaunchDaemons/local.claude-bodyguard.plist' ] || [ -L '/Library/LaunchDaemons/local.tz-watchdog.plist' ]; then echo '拒绝符号链接服务配置'; exit 1; fi;
-        cp '$H/.local/bin/local.claude-bodyguard.plist' '$H/.local/bin/local.tz-watchdog.plist' /Library/LaunchDaemons/;
-        chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
-        chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
-        launchctl bootout system/local.claude-bodyguard 2>/dev/null; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist;
-        launchctl bootout system/local.tz-watchdog 2>/dev/null; launchctl bootstrap system /Library/LaunchDaemons/local.tz-watchdog.plist;
+        cp -X '$H/.local/bin/local.claude-bodyguard.plist' '$H/.local/bin/local.tz-watchdog.plist' /Library/LaunchDaemons/ || exit 1;
+        /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist 2>/dev/null || true;
+        chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist || exit 1;
+        chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist || exit 1;
+        launchctl bootout system/local.claude-bodyguard 2>/dev/null || true; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1;
+        launchctl bootout system/local.tz-watchdog 2>/dev/null || true; launchctl bootstrap system /Library/LaunchDaemons/local.tz-watchdog.plist || exit 1; launchctl print system/local.tz-watchdog >/dev/null 2>&1 || exit 1;
         launchctl bootout system/local.claude-update 2>/dev/null; rm -f /Library/LaunchDaemons/local.claude-update.plist;"
     curt=$(readlink /etc/localtime 2>/dev/null)
     [ "$curt" != "/var/db/timezone/zoneinfo/$TZV" ] && SYSCMDS="$SYSCMDS /usr/sbin/systemsetup -settimezone '$TZV';"
@@ -437,7 +439,8 @@ else
 
     # 自动更新:用户态 LaunchAgent(每12小时),不走 root,降低供应链风险
     mkdir -p "$H/Library/LaunchAgents"
-    cp "$H/.local/bin/local.claude-update.plist" "$H/Library/LaunchAgents/local.claude-update.plist"
+    cp -X "$H/.local/bin/local.claude-update.plist" "$H/Library/LaunchAgents/local.claude-update.plist"
+    /usr/bin/xattr -d com.apple.quarantine "$H/Library/LaunchAgents/local.claude-update.plist" 2>/dev/null || true
     launchctl bootout "gui/$(id -u)/local.claude-update" 2>/dev/null
     if launchctl bootstrap "gui/$(id -u)" "$H/Library/LaunchAgents/local.claude-update.plist" 2>/dev/null; then
         echo "✓ 自动更新服务已注册(每12小时检查一次)"

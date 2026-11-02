@@ -33,6 +33,8 @@ class SnapshotSafetyTests(unittest.TestCase):
         cls.archive = function_source("archive_current")
         cls.switch = function_source("switch_to")
         cls.valid = function_source("valid_account")
+        cls.cli_lock = "\n".join(function_source(name) for name in (
+            "cli_lock_acquire", "cli_lock_release"))
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(
@@ -67,6 +69,7 @@ copy_tree() {
     mkdir -p "$2" && cp -R "$1/." "$2/"
 }
 quit_claude() { return 0; }
+quit_cli() { return 0; }
 open() { printf 'called' > "$FIXTURE/launched"; }
 mv() {
     if [ "$INJECT" = "first_move_error" ] && [ "$1" = "$DATA" ]; then
@@ -89,7 +92,7 @@ mv() {
 }
 '''
         return subprocess.run(
-            ["/bin/bash", "-c", harness + "\n" + self.valid + "\n" + code],
+            ["/bin/bash", "-c", harness + "\n" + self.valid + "\n" + self.cli_lock + "\n" + code],
             env=env,
             cwd=self.fixture,
             text=True,

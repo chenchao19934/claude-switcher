@@ -8,7 +8,7 @@
 
 > 🛠️ **本项目持续活跃更新中**——防护项随目标平台风控演进不断增加，见下方[路线图](#路线图)。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/chenchao19934/claude-switcher?label=release&color=blue)](https://github.com/chenchao19934/claude-switcher/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-macOS-blue.svg)]()
 [![Windows](https://img.shields.io/badge/Windows-Beta-lightgrey.svg)](windows/)
@@ -53,8 +53,8 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 | 09 | WebRTC | 多节点 STUN 交叉探测（详见第 2 节） |
 | 10 | 保镖守护进程 | Kill-Switch 是否在线（详见第 3 节） |
 | 11 | 置顶路由规则 | 生态域名是否被强制走代理（详见第 6 节） |
-| 12 | 客户端语言 | 防止 JS 层 `navigator.language` / `Intl` 读出系统中文 |
-| 13 | ASN 属性 | 住宅宽带 vs 机房 IP（Residential vs Datacenter） |
+| 12 | 客户端语言 | 核对语言与目标地区；Windows 读取 Claude 配置，不代表已验证运行中的 JS 语言值 |
+| 13 | ASN 属性 | 核对网络类型；ISP 分类不等同于具体 IP 的住宅认证，Windows 检测边界见 [说明](windows/README.md#客户端语言与-asn-检查) |
 | 14 | 生态可达性 | claude.ai / api.anthropic.com 连通性验证 |
 
 > 关于「IP 与上次一致」：除了比对上一次出口，审计引擎还会维护 48 小时出口 IP 历史——**48 小时内出口 IP 变化 ≥3 次会亮黄色警告**（不阻断启动）。IP 频繁漂移意味着账号画像在风控眼里"居无定所"，建议固定一条高质量住宅节点长期使用。禁用 IP 一致检查后不会执行出口比对，也不会写入这份历史。
@@ -225,7 +225,7 @@ Mac 开发环境、隔离界面启动与应用打包见 [macOS 开发指南](doc
   - `已建档 · 1.2G`：该槽位已有独立快照，显示快照体积
   - `首次登录`：空槽位，审计通过后点击创建新身份并登录
 - **快照位置**：`~/.claude-switcher/accounts/<A|B|C|D>/`。切换时当前账号会先归档到对应目录，再把目标账号还原到 `~/Library/Application Support/Claude`；四个目录彼此独立，互不覆盖。
-- **CLI**：`~/.local/bin/claude-switch.sh switch A|B|C|D`。账号参数只接受 A–D，其他值会输出 `FAIL:` 并拒绝切换。
+- **CLI**：`~/.local/bin/claude-switch.sh switch A|B|C|D`。账号参数只接受 A–D，其他值会输出 `FAIL:` 并拒绝切换。终端 Claude Code 与桌面账号联动用 `cli` / `cli-current`，见下文「Claude Code 多账号联动」。
 - **状态**：`claude-switch.sh status` 在原有 `current/hasA/hasB` 字段外新增 `hasC/hasD`、`accounts=A,B,C`（无归档时为 `none`）与 `accA=<大小>@<日期>`；旧版界面仍可读取前两组字段。
 - 加密导出/导入同样支持 C/D：`snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`。
 
@@ -311,6 +311,43 @@ Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SH
 - `~/.claude` 配置目录是否存在及体积
 
 该命令**只检测不修改**：不会卸载、升级或删除任何东西；需要重装时按输出里的建议自行执行对应包管理器命令。
+
+## Claude Code 多账号联动（macOS CLI）
+
+终端里的 Claude Code 可以和桌面版使用同一账号：切换器按桌面当前账号映射独立的 `CLAUDE_CONFIG_DIR`（官方支持的多账号登录机制），再用映射后的目录启动真实 CLI。
+
+```bash
+# 以当前桌面账号启动 Claude Code，参数原样透传
+~/.local/bin/claude-switch.sh cli --resume
+
+# 只查看当前映射：输出 current=<槽位> config=<目录>
+~/.local/bin/claude-switch.sh cli-current
+```
+
+**账号映射与历史**：
+
+- 账号 A 使用既有 `~/.claude` 目录——已有登录态、设置和对话历史原样保留，不发生迁移
+- 账号 B/C/D 各使用 `~/.claude-switcher/cli-accounts/<槽位>/`（权限 0700）；首次使用会在各自目录下要求登录一次，之后直接复用
+- 各槽位的设置、登录态、对话历史互相独立，切换桌面账号后 CLI 侧按槽位独立恢复
+- 钥匙串条目由 CLI 按配置目录自动隔离，**无需也不应**导出、复制钥匙串或交换凭据文件
+
+**启动前防线**（`cli` 每次启动都执行）：
+
+- 要求桌面切换器已有有效 A–D 当前账号，未初始化时拒绝猜测
+- 检测到 `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY`、`ANTHROPIC_PROFILE` 等认证环境变量覆盖时拒绝启动；已设置的 `CLAUDE_CONFIG_DIR` 与目标槽位不一致也拒绝
+- 通过 CLI 启动与桌面切换共用原子锁串行化账号操作，再运行完整 `check` 环境审计；任何硬性失败都阻止启动，审计通过到启动前会重读当前账号，期间账号变化立即拒绝，避免启动与切换竞态串号。既有 B–D 账号目录或父目录为符号链接时同样拒绝
+
+**切换与急停**：
+
+- 切换桌面账号前，切换器通过 `ps` 识别并 TERM 安装用户的 CLI 进程（native `claude`/`claude.exe` 及 npm/bun 的 `@anthropic-ai/claude-code`），最多等待 10 秒；**CLI 未退出则停止切换**，桌面数据与当前指针保持不变。同一账号重复启动桌面版不要求退出 CLI
+- 保镖发现代理离线时，同时终止桌面版与上述 CLI 进程；只处理安装用户的进程，不按名字扫全系统
+
+**边界与限制**：
+
+- 直接绕过 `claude-switch.sh cli` 运行原始 `claude`，以上防线一律不参与，**无法保证与桌面账号一致**；保镖的代理离线急停仍然兜底
+- 加密桌面快照（`snapshot-export`）只含桌面数据，**不包含**独立 CLI 配置目录；迁移到新机器后 CLI 侧可能需要重新登录
+- 想在终端少打字可以自己在 shell 配置里加显式 alias（如 `alias ccc="$HOME/.local/bin/claude-switch.sh cli"`），安装器不会静默修改 shell 配置
+- 本功能当前验证范围为隔离回归（临时 HOME + 假 CLI + 假进程），**尚未做真机验收**；B–D 首次真实登录与保镖急停行为以真机为准
 
 ## 安全打开链接（open-safe，macOS）
 
@@ -461,13 +498,13 @@ WEBRTC_POLICY=proxy ~/.local/bin/claude-switch.sh fix
 
 欢迎 Fork / PR。Issue 区接受场景补充——你遇到的每一个真实泄漏场景，都可能成为下一个检查项。
 
-## 微信交流群
+## 微信联系
 
-欢迎加入 **claude-switcher 交流群**，交流安装配置、使用心得和问题排查。使用微信扫描下方二维码即可入群：
+扫码添加维护者 **JEYO** 的个人微信，交流安装配置、使用心得和问题排查。添加好友时请备注 `claude-switcher`：
 
-![claude-switcher 微信交流群二维码](assets/wechat-group.png)
+![JEYO 微信二维码](assets/wechat-personal.jpg)
 
-> 当前二维码标注 **2026 年 11 月 2 日前有效**。若二维码过期或无法入群，请通过 [Issue](https://github.com/YOURSJEYO/claude-switcher/issues) 提醒维护者更新。
+> 若二维码失效，请通过 [Issue](https://github.com/YOURSJEYO/claude-switcher/issues) 提醒维护者更新。
 
 Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 
@@ -514,4 +551,6 @@ Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 
 ## License
 
-MIT © Claude Switcher Contributors
+AGPL-3.0-only © 2026 Claude Switcher Contributors
+
+> 自 2026 年 11 月 2 日起发布的新版本采用 AGPL-3.0-only。此前发布的 MIT 版本仍按 MIT 授权，已授予的权利不受影响。

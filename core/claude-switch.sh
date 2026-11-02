@@ -406,14 +406,26 @@ def select_group(config, configured):
 
 
 def current_profile(home):
+    import subprocess
+
     path = home / "shared_preferences.json"
     try:
-        values = json.loads(path.read_text(encoding="utf-8"))
-        profile_id = values.get("flutter.currentProfileId")
+        if path.is_file():
+            values = json.loads(path.read_text(encoding="utf-8"))
+            profile_id = values.get("flutter.currentProfileId")
+        elif home.resolve() == (Path.home() / "Library/Application Support/com.follow.clash").resolve():
+            # macOS Flutter preferences use CFPreferences, not shared_preferences.json.
+            result = subprocess.run(
+                ["/usr/bin/defaults", "read", "com.follow.clash", "flutter.config"],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            profile_id = json.loads(result.stdout).get("currentProfileId")
+        else:
+            fail("无法读取当前 Profile，已保留原配置")
         if type(profile_id) is not int or profile_id <= 0:
             fail("无法识别当前 Profile，已保留原配置")
         return profile_id
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
         fail("无法读取当前 Profile，已保留原配置")
 
 
@@ -426,7 +438,7 @@ def repair(home, configured):
         fail("缺少 FlClash 数据库或运行配置")
     profile_id = current_profile(home)
     config = config_path.read_text(encoding="utf-8")
-    if not re.search(r"enhanced-mode:\s*fake-ip\b|fake-ip:\s*true\b", config, re.I):
+    if not re.search(r"enhanced-mode:\s*[\"\']?fake-ip\b|fake-ip:\s*true\b", config, re.I):
         fail("请先在 FlClash 中启用 fake-IP，再执行修复")
     target = select_group(config, configured)
     backup = None
@@ -579,14 +591,23 @@ def controller_config(clash_dir):
             if not os.path.isabs(unix_path):
                 fail("Clash Unix socket 路径必须为绝对路径")
             # 生成的配置可能记着已失效的临时 socket(Clash Verge 重启后路径会变);
-            # 依次尝试配置路径与服务实际使用的用户级 socket,都存在才继续走 TCP 分支
+            # 依次探测配置路径与服务实际使用的用户级 socket,跳过已失效的残留文件
             candidates = [unix_path]
             if hasattr(os, "getuid"):
                 candidates.append(
                     "/var/run/clash-verge-service/users/%d/verge-mihomo.sock" % os.getuid())
             for candidate in candidates:
-                if os.path.isabs(candidate) and Path(candidate).exists():
-                    return ("unix", candidate, None), secret
+                if not os.path.isabs(candidate) or not Path(candidate).exists():
+                    continue
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    probe.settimeout(0.2)
+                    probe.connect(candidate)
+                except OSError:
+                    continue
+                finally:
+                    probe.close()
+                return ("unix", candidate, None), secret
         endpoint = read_yaml_scalar(path, "external-controller")
         if endpoint:
             if not endpoint.startswith(("http://", "https://")):
@@ -1601,7 +1622,7 @@ fix() {
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
     echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
-        adminCmds="${adminCmds}cp $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ && chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist && launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist; "
+        adminCmds="${adminCmds}cp -X $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ || exit 1; /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist 2>/dev/null || true; chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1; "
     fi
     if [ -n "$adminCmds" ]; then
         adminCmds="${adminCmds}dscacheutil -flushcache; killall -HUP mDNSResponder"
@@ -2448,6 +2469,99 @@ quit_claude() {
     return 1
 }
 
+cli_config_dir() {
+    case "${1:-}" in
+        A) printf '%s\n' "$HOME/.claude" ;;
+        B|C|D) printf '%s\n' "$BASE/cli-accounts/$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+cli_pids() {
+    local uid="${1:-$(id -u)}"
+    ps -axo pid=,uid=,comm=,args= | awk -v uid="$uid" '
+        $2 == uid && ($3 ~ /(^|\/)(claude|claude\.exe)$/ ||
+        ($3 ~ /(^|\/)(node|bun)$/ && $5 ~ /(^|\/)@anthropic-ai\/claude-code\/(bin\/claude(\.exe)?|cli\.js)$/)) { print $1 }'
+}
+
+quit_cli() {
+    local uid="${1:-$(id -u)}" pids i
+    pids=$(cli_pids "$uid")
+    [ -z "$pids" ] && return 0
+    kill -TERM $pids 2>/dev/null || true
+    for i in $(seq 1 10); do
+        pids=$(cli_pids "$uid")
+        [ -z "$pids" ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+cli_lock_acquire() {
+    [ "${CLI_LOCK_HELD:-0}" -eq 1 ] && return 0
+    if mkdir "$BASE/cli-operation.lock" 2>/dev/null; then
+        CLI_LOCK_HELD=1
+        trap cli_lock_release EXIT
+        return 0
+    fi
+    echo "FAIL:另一个 CLI 启动或账号切换正在进行，请稍后重试"
+    return 1
+}
+
+cli_lock_release() {
+    if [ "${CLI_LOCK_HELD:-0}" -eq 1 ]; then
+        rmdir "$BASE/cli-operation.lock" 2>/dev/null || true
+        CLI_LOCK_HELD=0
+    fi
+}
+
+run_cli() {
+    local cur dir cli_path audit var pid
+    cli_lock_acquire || return 1
+    [ -f "$BASE/current" ] || { echo "FAIL:请先在桌面切换器中初始化账号"; return 1; }
+    cur=$(cat "$BASE/current")
+    dir=$(cli_config_dir "$cur") || { echo "FAIL:当前账号无效，请先重新切换账号"; return 1; }
+    for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
+        CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_PROFILE; do
+        if [ -n "${!var-}" ]; then
+            echo "FAIL:检测到认证环境变量 $var，无法保证账号隔离，已拒绝启动"
+            return 1
+        fi
+    done
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ "$CLAUDE_CONFIG_DIR" != "$dir" ]; then
+        echo "FAIL:CLAUDE_CONFIG_DIR 与当前账号不一致，请修正后重试"
+        return 1
+    fi
+    cli_path=$(command -v claude) || { echo "FAIL:未找到 Claude Code CLI"; return 1; }
+    case "$cli_path" in
+        /*) ;;
+        *) echo "FAIL:无法解析 Claude Code CLI 的真实路径"; return 1 ;;
+    esac
+    audit=$(check) || { printf '%s\n' "$audit" >&2; echo "FAIL:环境审计未通过，已阻止启动 Claude Code"; return 1; }
+    [ "$(cat "$BASE/current")" = "$cur" ] || { echo "FAIL:审计期间账号已变化，请重新启动 Claude Code"; return 1; }
+    if [ "$cur" != "A" ]; then
+        if [ -L "$BASE/cli-accounts" ] || [ -L "$dir" ]; then
+            echo "FAIL:CLI 账号目录不能是符号链接"
+            return 1
+        fi
+        mkdir -p "$BASE/cli-accounts" "$dir" || { echo "FAIL:无法创建 CLI 账号目录"; return 1; }
+        chmod 700 "$BASE/cli-accounts" "$dir" || { echo "FAIL:无法保护 CLI 账号目录"; return 1; }
+    fi
+    # 非交互 Bash 的后台命令默认从 /dev/null 读取；保留终端与管道输入。
+    CLAUDE_CONFIG_DIR="$dir" "$cli_path" "$@" <&0 &
+    pid=$!
+    cli_lock_release
+    wait "$pid"
+}
+
+cli_current() {
+    local cur dir
+    [ -f "$BASE/current" ] || { echo "FAIL:请先在桌面切换器中初始化账号"; return 1; }
+    cur=$(cat "$BASE/current")
+    dir=$(cli_config_dir "$cur") || { echo "FAIL:当前账号无效"; return 1; }
+    echo "current=$cur config=$dir"
+}
+
 archive_current() {
     local cur="$1"
     local t0 staged current previous moved=0 had_old=0
@@ -2599,12 +2713,15 @@ restore_keep_paths() {
 switch_to() {
     target="${1:-}"
     valid_account "$target" || return 1
+    # 当前账号和同槽恢复也属于事务；读取前加锁，避免并发归档到旧槽位。
+    cli_lock_acquire || return 1
     cur="none"; [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
     just_archived=0
 
     # 首次运行:把当前登录中的状态收编为账号A
     if [ "$cur" = "none" ] && [ -d "$DATA" ] && [ -n "$(ls -A "$DATA" 2>/dev/null)" ]; then
         quit_claude || { echo "FAIL:Claude 未能退出，请手动退出后重试"; return 1; }
+        quit_cli || { echo "FAIL:Claude Code 未能退出，请手动退出后重试"; return 1; }
         if [ -s "$BASE/keep-in-workspace.txt" ]; then
             stage_keep_paths || { echo "FAIL:跨身份保留暂存失败，已停止切换"; return 1; }
         fi
@@ -2638,6 +2755,7 @@ switch_to() {
     fi
 
     quit_claude || { echo "FAIL:Claude 未能退出，请手动退出后重试"; return 1; }
+    quit_cli || { echo "FAIL:Claude Code 未能退出，请手动退出后重试"; return 1; }
 
     if [ "$just_archived" = "0" ] && [ "$cur" != "none" ] && [ -d "$DATA" ]; then
         if [ -s "$BASE/keep-in-workspace.txt" ]; then
@@ -2712,6 +2830,8 @@ case "$operation" in
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;
     cli-info) cli_info ;;
+    cli) run_cli "${@:2}" ;;
+    cli-current) cli_current ;;
     snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;
     snapshot-import) snapshot_import "${2:-}" "${3:-}" "${4:-}" ;;
     export-diagnostics) "$0" _support export-diagnostics "${2:-}" ;;
@@ -2719,7 +2839,7 @@ case "$operation" in
     set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
 rc=$?
 case "$operation" in
