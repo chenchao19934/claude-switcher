@@ -9,6 +9,37 @@ echo "  Claude 账号切换器 · 安装程序"
 echo "=================================="
 echo ""
 
+# 只解析当前安装包根目录的版本文件，不执行其内容或读取已安装版本。
+installer_version() {
+    python3 -I -B - "$1/VERSION" <<'PY_INSTALLER_VERSION'
+import os
+import re
+import stat
+import sys
+
+try:
+    descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except FileNotFoundError:
+    print("0.0.0-dev")
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit("VERSION 无法安全读取，请重新下载完整安装包")
+
+try:
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 80:
+            raise ValueError("invalid version file")
+        version = stream.read(81).decode("ascii").strip()
+    number = r"(?:0|[1-9][0-9]*)"
+    if not re.fullmatch(number + r"\." + number + r"\." + number + r"(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", version):
+        raise ValueError("invalid version")
+except (OSError, ValueError, UnicodeError):
+    raise SystemExit("VERSION 内容或文件类型无效，请重新下载完整安装包")
+print(version)
+PY_INSTALLER_VERSION
+}
+
 # 国家代码 → 默认 IANA 时区(cloudflare trace 等来源不带时区时使用)
 default_tz_for() {
     case "$1" in
@@ -181,7 +212,12 @@ if ! command -v swiftc >/dev/null 2>&1; then
     echo "   如遇失败请安装完整 Xcode 并执行: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
     read -n 1 -s -r -p "按任意键退出..."; exit 1
 fi
+if ! APP_VERSION=$(installer_version "$REPO"); then
+    echo "✗ 无法确认安装包版本，已停止安装"
+    exit 1
+fi
 echo "✓ 前置检查通过($MODE / Claude / python3 / swiftc)"
+echo "✓ 安装版本: $APP_VERSION"
 
 # ---- 1. 自动探测代理组名(仅 Clash Verge;多个 select 组时让用户选,避免静默选错专线) ----
 GRP=""
@@ -367,8 +403,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<key>CFBundleName</key><string>Claude切换器</string>
 	<key>CFBundleDisplayName</key><string>Claude切换器</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0</string>
-	<key>CFBundleVersion</key><string>1</string>
+	<key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
+	<key>CFBundleVersion</key><string>$APP_VERSION</string>
 	<key>LSMinimumSystemVersion</key><string>13.0</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>NSHighResolutionCapable</key><true/>

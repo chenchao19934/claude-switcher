@@ -163,6 +163,7 @@ mkdir -p "$KIT_ROOT"
 for FILE in README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS; do
     cp "$ROOT/$FILE" "$KIT_ROOT/"
 done
+printf '%s\n' "$VERSION" > "$KIT_ROOT/VERSION"
 for DIR in core daemons installer app; do
     ditto "$ROOT/$DIR" "$KIT_ROOT/$DIR"
 done
@@ -176,7 +177,7 @@ cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
 cp "$ROOT/docs/images/macos-background-polling.png" "$KIT_ROOT/docs/images/"
 chmod +x "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command"
 for ITEM in \
-    README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS \
+    README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS VERSION \
     core/claude-switch.sh core/stun-probe.py core/desktop-update.py daemons/claude-bodyguard.sh daemons/bodyguard-settings.py installer/安装.command \
     app/main.swift assets/icon-2048.png docs/MACOS-UPDATES.md docs/screenshot.png docs/images/macos-background-polling.png; do
     if [ ! -e "$KIT_ROOT/$ITEM" ]; then

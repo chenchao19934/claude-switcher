@@ -17,7 +17,7 @@ concurrency:
 jobs:
   checks:
     name: Shell, tests, Swift, sums
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - name: Checkout
         uses: actions/checkout@v4

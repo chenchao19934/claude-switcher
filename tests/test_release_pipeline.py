@@ -129,6 +129,21 @@ class ReleasePipelineTests(unittest.TestCase):
             self.assertNotIn("ref", checkout.get("with", {}),
                              "Reusable checks must not override the calling release tag with a branch")
 
+    def test_checks_and_publication_leave_arm_runners_for_native_builds(self):
+        self.assertEqual(self.checks_workflow["jobs"]["checks"]["runs-on"], "macos-15-intel")
+        jobs = self.workflow["jobs"]
+        self.assertEqual(jobs["publish"]["runs-on"], "macos-15-intel")
+        self.assertEqual(jobs["macos"]["runs-on"], "${{ matrix.os }}")
+        native_runners = {item["arch"]: item["os"]
+                          for item in jobs["macos"]["strategy"]["matrix"]["include"]}
+        self.assertEqual(native_runners, {"arm64": "macos-15", "x86_64": "macos-15-intel"})
+        package = next(step for step in jobs["macos"]["steps"]
+                       if step["name"] == "Package macOS release assets")
+        self.assertEqual(package["env"]["EXPECTED_ARCH"], "${{ matrix.arch }}")
+        self.assertIn('test "$(uname -m)" = "$EXPECTED_ARCH"', package["run"])
+        self.assertIn('test "$(lipo -archs build/Claude切换器.app/Contents/MacOS/ClaudeSwitcher)" = "$EXPECTED_ARCH"',
+                      package["run"])
+
     def test_tag_validator_accepts_only_three_numeric_semver_parts(self):
         for tag in ("v0.0.0", "v1.2.3", "v12.34.56"):
             with self.subTest(tag=tag):
